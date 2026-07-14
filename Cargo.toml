@@ -3,6 +3,11 @@ name = "fandango"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+autobins = false
+
+[[bin]]
+name = "fandango-rs"
+path = "src/main.rs"
 
 [dependencies]
 fandango-core = { path = "core" }
@@ -10,6 +15,7 @@ fandango-derive = { path = "derive", default-features = false }
 
 pest.workspace = true
 pest_derive.workspace = true
+rand = { workspace = true, features = ["std_rng"] }
 tuple_list.workspace = true
 
 [dev-dependencies]
