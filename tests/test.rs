@@ -341,6 +341,35 @@ mod simple {
     }
 }
 
+mod grouped_kpath {
+    use super::*;
+    use core::num::NonZeroUsize;
+    use fandango::Fandango;
+    use fandango_core::typing::Structured;
+    use fandango_core::visitor::Visitor;
+    use fandango_core::visitor::kpath::{KPathUpdate, KPaths};
+
+    #[derive(Fandango)]
+    #[fandango(grammar = "tests/grammars/kpath-grouped.fan", parse = true)]
+    pub struct GroupedKPath;
+
+    #[test]
+    fn grouped_repetition_paths_match_the_generated_tree() {
+        let mut paths = KPaths::new::<TypeMut<'static>>(
+            NonZeroUsize::new(5).unwrap(),
+            nonterminal_start::ROOT.inner(),
+        );
+        let mut updater = KPathUpdate::inserting(&mut paths);
+
+        for sample in ["a", "b", "a,a", "a,b", "b,a", "b,b"] {
+            let tree = GroupedKPath::extract(sample).unwrap();
+            updater = updater.visit(&tree, 0).unwrap().continue_value().unwrap();
+        }
+
+        assert_eq!(updater.kpaths().k_paths().0, 0);
+    }
+}
+
 mod pest_renamed {
     use super::*;
     use fandango::Fandango;

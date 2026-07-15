@@ -2,7 +2,8 @@
 //!
 //! See: <https://publications.cispa.saarland/3572/1/tosem-codeine-arxiv.pdf>
 
-use crate::lang::{FandangoNode, Operator, Program, Symbol};
+use crate::graph::IntoGraph;
+use crate::lang::{FandangoNode, Program};
 use crate::typing::{AsNodeRef, DiscriminantLookup, Node, Opaque};
 use crate::visitor::{VisitResult, VisitableChildren, Visitor};
 use alloc::collections::VecDeque;
@@ -15,6 +16,7 @@ use hashbrown::hash_set::Entry;
 use hashbrown::{HashMap, HashSet};
 
 use mappable_rc::Mrc;
+use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Represents the current state of a k-paths computation.
@@ -120,74 +122,6 @@ impl KPaths {
         }
     }
 
-    fn collect_edges<T>(
-        definition: FandangoNode<'static, 'static>,
-        collected: &mut HashMap<usize, Vec<usize>>,
-    ) -> FandangoNode<'static, 'static>
-    where
-        T: DiscriminantLookup,
-    {
-        let children: Vec<_> = match definition {
-            nt @ FandangoNode::Nonterminal(_) => return nt, // nothing to do
-            FandangoNode::Alternative(alt) => {
-                if alt.concatenations().len() == 1 {
-                    return Self::collect_edges::<T>(
-                        FandangoNode::Concatenation(alt.concatenations()[0].inner()),
-                        collected,
-                    );
-                }
-                alt.concatenations()
-                    .iter()
-                    .map(|c| FandangoNode::Concatenation(c.inner()))
-                    .collect()
-            }
-            FandangoNode::Concatenation(concat) => {
-                if concat.operators().len() == 1 {
-                    return Self::collect_edges::<T>(
-                        FandangoNode::Operator(concat.operators()[0].inner()),
-                        collected,
-                    );
-                }
-                concat
-                    .operators()
-                    .iter()
-                    .map(|c| FandangoNode::Operator(c.inner()))
-                    .collect()
-            }
-            FandangoNode::Operator(
-                Operator::Kleene(sym)
-                | Operator::Plus(sym)
-                | Operator::Option(sym)
-                | Operator::Repeat(sym, _, _)
-                | Operator::Symbol(sym),
-            ) => {
-                // TODO: is there another way we should be computing k-path here?
-                return Self::collect_edges::<T>(FandangoNode::Symbol(sym.inner()), collected);
-            }
-            FandangoNode::Symbol(sym) => {
-                let inner = match sym {
-                    Symbol::Nonterminal(nt) => FandangoNode::from(nt),
-                    Symbol::Alternative(alt) => FandangoNode::from(alt),
-                    Symbol::String(s) => FandangoNode::from(s),
-                };
-                return Self::collect_edges::<T>(inner, collected);
-            }
-            s @ FandangoNode::String(_) => return s, // nothing to do
-            _ => unreachable!("Cannot generate this case."),
-        };
-
-        let discriminant = T::lookup_discriminant(&definition);
-        let children = children
-            .into_iter()
-            .map(|child| Self::collect_edges::<T>(child, collected))
-            .map(|n| T::lookup_discriminant(&n))
-            .collect();
-
-        assert!(collected.insert(discriminant, children).is_none());
-
-        definition
-    }
-
     /// Create a new k-paths state for the given program.
     ///
     /// You need to specify `T` here. If you're using a dynamic implementation, use
@@ -195,20 +129,47 @@ impl KPaths {
     ///
     /// # Panics
     ///
-    /// Panics if a nonterminal's discriminant is duplicated, which is not possible with
-    /// static grammars. You'd have to be very unlucky for it to happen with dynamic.
+    /// Panics if the program does not contain a `start` nonterminal or if `T` cannot map a
+    /// reachable grammar node to its generated-tree discriminant.
     #[must_use]
     pub fn new<T>(k: NonZeroUsize, program: &'static Program) -> KPaths
     where
         T: DiscriminantLookup,
     {
-        let nonterminals = program.nonterminals();
+        // This is the same graph consumed by the static code generator. Building k-path edges
+        // from it keeps the coverage universe exactly aligned with the generated nodes and their
+        // `VisitableChildren` implementations, including elided wrappers and grouped repetition.
+        let (_, graph) = program.into_graph();
+        let start = graph
+            .node_indices()
+            .find(|&index| {
+                matches!(
+                    graph.node_weight(index),
+                    Some(FandangoNode::Nonterminal(nonterminal))
+                        if nonterminal.name() == "start"
+                )
+            })
+            .expect("program must contain a start nonterminal");
+
         let mut edges = HashMap::new();
-        for (nonterminal, definition) in &nonterminals {
-            let definition = Self::collect_edges::<T>(*definition, &mut edges);
-            let nonterminal = T::lookup_discriminant(nonterminal);
-            let definition = T::lookup_discriminant(&definition);
-            assert!(edges.insert(nonterminal, vec![definition]).is_none());
+        let mut pending = VecDeque::from([start]);
+        let mut visited = HashSet::new();
+        while let Some(parent) = pending.pop_front() {
+            if !visited.insert(parent) {
+                continue;
+            }
+            let parent_node = *graph.node_weight(parent).unwrap();
+            let children = graph
+                .edges(parent)
+                .map(|edge| edge.target())
+                .collect::<Vec<_>>();
+            pending.extend(children.iter().copied());
+            let children = children
+                .into_iter()
+                .map(|child| T::lookup_discriminant(graph.node_weight(child).unwrap()))
+                .collect();
+            let parent = T::lookup_discriminant(&parent_node);
+            assert!(edges.insert(parent, children).is_none());
         }
 
         Self::from_edges(k, &edges)

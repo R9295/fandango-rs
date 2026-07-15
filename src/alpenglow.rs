@@ -4,9 +4,13 @@ use fandango::{
     Fandango,
     generation::Generator,
     typing::{AsNodeRef, Downcast, Node, Opaque, Structured},
-    visitor::{VisitResult, VisitableChildren, Visitor, kpath::KPaths, write::WriteVisitor},
+    visitor::{
+        VisitResult, VisitableChildren, Visitor,
+        kpath::{KPathUpdate, KPaths},
+        write::WriteVisitor,
+    },
 };
-use rand::{Rng, SeedableRng, seq::SliceRandom};
+use rand::{Rng, SeedableRng};
 use std::{
     collections::{HashSet, VecDeque},
     convert::Infallible,
@@ -19,11 +23,9 @@ use std::{
 
 const NUM_SLOTS: usize = 32;
 const VALIDATOR_COUNT: usize = 100;
-const BYZANTINE_VALIDATORS: usize = 19;
-const MAX_ABSENT_VALIDATORS: usize = 20;
 const BLOCKS_PER_SLOT: usize = 4;
-const HONEST_MAIN_BLOCK_VOTE_PROBABILITY: f64 = 0.70;
-const HONEST_FALLBACK_VOTE_PROBABILITY: f64 = 0.50;
+const MAX_VOTES_PER_VALIDATOR: usize = 5;
+const MAX_ROUND2_VOTES: usize = 5;
 const QUORUM_VALIDATORS: usize = 60;
 const SAFE_VALIDATORS: usize = 40;
 const MIN_NOTARIZE_VALIDATORS: usize = 20;
@@ -90,7 +92,6 @@ impl Scenario {
         R: Rng + ?Sized,
     {
         let roles = generate_roles(rng);
-        let mut used_block_ids = HashSet::new();
         let mut slots = Vec::with_capacity(NUM_SLOTS);
         let mut observer_already_skipped = false;
 
@@ -99,19 +100,10 @@ impl Scenario {
                 observer_already_skipped = false;
             }
 
-            let block_ids = generate_block_ids(rng, &mut used_block_ids);
-            let main_block = rng.random_range(0..BLOCKS_PER_SLOT);
-            let mut round1 = roles
-                .iter()
-                .copied()
-                .map(|role| generate_vote_set(rng, role, main_block))
-                .collect::<Vec<_>>();
-
-            // v1's fallback behavior is the oracle output, not a round-one input.
-            round1[0].truncate(1);
-            if observer_already_skipped {
-                round1[0] = vec![Vote::Skip];
-            }
+            let block_ids = generate_block_ids(rng);
+            let mut round1 = Vec::with_capacity(VALIDATOR_COUNT);
+            round1.push(vec![generate_observer_vote(rng)]);
+            round1.extend((1..VALIDATOR_COUNT).map(|_| generate_vote_set(rng)));
 
             let (round2, skips_rest_of_window) =
                 simulate_round2(&round1, logical_slot, observer_already_skipped);
@@ -201,7 +193,7 @@ impl Scenario {
                 .map(parse_round2_vote)
                 .collect::<Result<Vec<_>, _>>()?;
             if round2.is_empty()
-                || round2.len() > 4
+                || round2.len() > MAX_ROUND2_VOTES
                 || (round2.len() > 1 && round2.contains(&Round2Vote::None))
             {
                 return Err(format!("invalid round2 vote set in slot {logical_slot}"));
@@ -264,40 +256,10 @@ impl Scenario {
                 self.slots.len()
             ));
         }
-        if self.roles[0] != Role::Honest {
-            violations.push("v1 must be honest".to_owned());
-        }
-        let byzantine = self
-            .roles
-            .iter()
-            .filter(|role| **role == Role::Byzantine)
-            .count();
-        if byzantine != BYZANTINE_VALIDATORS {
-            violations.push(format!(
-                "expected {BYZANTINE_VALIDATORS} Byzantine validators, got {byzantine}"
-            ));
-        }
-        let absent = self
-            .roles
-            .iter()
-            .filter(|role| **role == Role::Absent)
-            .count();
-        if absent > MAX_ABSENT_VALIDATORS {
-            violations.push(format!(
-                "expected at most {MAX_ABSENT_VALIDATORS} absent validators, got {absent}"
-            ));
-        }
-
-        let mut block_ids = HashSet::new();
         let mut observer_already_skipped = false;
         for (logical_slot, slot) in self.slots.iter().enumerate() {
             if logical_slot.is_multiple_of(LEADER_WINDOW_SLOTS) {
                 observer_already_skipped = false;
-            }
-            for block_id in slot.block_ids {
-                if !block_ids.insert(block_id) {
-                    violations.push(format!("duplicate block ID in slot {logical_slot}"));
-                }
             }
             if slot.round1.len() != VALIDATOR_COUNT {
                 violations.push(format!(
@@ -306,33 +268,11 @@ impl Scenario {
                 ));
                 continue;
             }
-            for (validator, (votes, role)) in slot.round1.iter().zip(&self.roles).enumerate() {
-                if infer_role(votes) != *role {
-                    violations.push(format!(
-                        "v{}'s votes do not match its role in slot {logical_slot}",
-                        validator + 1
-                    ));
-                }
-                if votes
-                    .first()
-                    .is_none_or(|vote| !matches!(vote, Vote::Absent | Vote::Block(_) | Vote::Skip))
-                {
-                    violations.push(format!(
-                        "v{} has no primary vote in slot {logical_slot}",
-                        validator + 1
-                    ));
-                }
-            }
             if !matches!(slot.round1[0].as_slice(), [Vote::Block(_) | Vote::Skip]) {
                 violations.push(format!(
-                    "v1 must have exactly one primary vote in slot {logical_slot}"
+                    "v1 must have exactly one vote in slot {logical_slot}"
                 ));
                 continue;
-            }
-            if observer_already_skipped && slot.round1[0] != [Vote::Skip] {
-                violations.push(format!(
-                    "v1 must skip the remainder of its leader window in slot {logical_slot}"
-                ));
             }
             let (expected_round2, skips_rest_of_window) =
                 simulate_round2(&slot.round1, logical_slot, observer_already_skipped);
@@ -460,57 +400,6 @@ pub struct KPathCoverage {
     covered: HashSet<Vec<usize>>,
 }
 
-/// Collect paths from the realized tree instead of looking them up while walking it.
-///
-/// `KPaths` currently omits some valid paths involving repeated grouped expressions from its
-/// precomputed lookup. `KPathUpdate` consequently panics on such a tree. Keeping collection
-/// independent of that lookup lets coverage include those paths while retaining the
-/// grammar-derived lookup as the initial coverage universe.
-struct RealizedKPathCollector {
-    k: usize,
-    stack: Vec<usize>,
-    paths: HashSet<Vec<usize>>,
-}
-
-impl RealizedKPathCollector {
-    fn new(k: NonZeroUsize) -> Self {
-        Self {
-            k: k.get(),
-            stack: Vec::new(),
-            paths: HashSet::new(),
-        }
-    }
-}
-
-impl<T> Visitor<T> for RealizedKPathCollector
-where
-    T: VisitableChildren<T>,
-{
-    type Continue = Self;
-    type Break = Infallible;
-    type Error = Infallible;
-
-    fn visit<'program, N>(mut self, node: &'program N, _index: usize) -> VisitResult<Self, T>
-    where
-        N: Node<Type<'program> = T>,
-        T: From<&'program N> + AsNodeRef<N>,
-    {
-        self.stack.push(node.discriminant());
-        let first = self.stack.len().saturating_sub(self.k);
-        for offset in first..self.stack.len() {
-            self.paths.insert(self.stack[offset..].to_vec());
-        }
-        let mut collector = node
-            .opaque()
-            .visit_each(self)
-            .unwrap()
-            .continue_value()
-            .unwrap();
-        collector.stack.pop();
-        Ok(ControlFlow::Continue(collector))
-    }
-}
-
 impl KPathCoverage {
     /// Load coverage from `state`, or create an empty state if the file does not exist.
     pub fn load(k: NonZeroUsize, state: Option<&Path>) -> io::Result<Self> {
@@ -566,6 +455,11 @@ impl KPathCoverage {
                     "invalid grammar path: {line}"
                 )));
             }
+            if !coverage.paths.lookup().contains_key(path.as_slice()) {
+                return Err(invalid_coverage_state(format!(
+                    "unknown grammar path: {line}"
+                )));
+            }
             coverage.covered.insert(path);
         }
         Ok(coverage)
@@ -573,25 +467,24 @@ impl KPathCoverage {
 
     /// Record every k-path present in a generated tree.
     pub fn observe(&mut self, tree: &nonterminal_start) {
-        let collector = RealizedKPathCollector::new(self.paths.k())
+        let updater = KPathUpdate::inserting(&mut self.paths)
             .visit(tree, 0)
             .unwrap()
             .continue_value()
             .unwrap();
-        self.covered.extend(collector.paths);
+        self.covered.extend(
+            updater
+                .kpaths()
+                .lookup()
+                .iter()
+                .filter(|(_, count)| **count != 0)
+                .map(|(path, _)| path.to_vec()),
+        );
     }
 
     /// Return `(covered, total)` for this grammar and k.
     pub fn totals(&self) -> (usize, usize) {
-        let total = self
-            .paths
-            .lookup()
-            .keys()
-            .map(|path| path.to_vec())
-            .chain(self.covered.iter().cloned())
-            .collect::<HashSet<_>>()
-            .len();
-        (self.covered.len(), total)
+        (self.covered.len(), self.paths.k_paths().1)
     }
 
     /// Persist the covered path set.
@@ -647,72 +540,97 @@ fn generate_roles<R>(rng: &mut R) -> Vec<Role>
 where
     R: Rng + ?Sized,
 {
-    let mut roles = vec![Role::Honest; VALIDATOR_COUNT];
-    let mut eligible = (1..VALIDATOR_COUNT).collect::<Vec<_>>();
-    eligible.shuffle(rng);
-    let absent = rng.random_range(0..=MAX_ABSENT_VALIDATORS);
-    for validator in eligible.iter().take(BYZANTINE_VALIDATORS) {
-        roles[*validator] = Role::Byzantine;
-    }
-    for validator in eligible.iter().skip(BYZANTINE_VALIDATORS).take(absent) {
-        roles[*validator] = Role::Absent;
-    }
-    roles
+    (0..VALIDATOR_COUNT)
+        .map(|_| match rng.random_range(0..3) {
+            0 => Role::Honest,
+            1 => Role::Absent,
+            2 => Role::Byzantine,
+            _ => unreachable!(),
+        })
+        .collect()
 }
 
-fn generate_block_ids<R>(rng: &mut R, used: &mut HashSet<[u8; 32]>) -> [[u8; 32]; BLOCKS_PER_SLOT]
+fn generate_block_ids<R>(rng: &mut R) -> [[u8; 32]; BLOCKS_PER_SLOT]
 where
     R: Rng + ?Sized,
 {
-    std::array::from_fn(|_| {
-        loop {
-            let block_id = rng.random();
-            if used.insert(block_id) {
-                break block_id;
-            }
-        }
-    })
+    std::array::from_fn(|_| rng.random())
 }
 
-fn generate_vote_set<R>(rng: &mut R, role: Role, main_block: usize) -> Vec<Vote>
+fn generate_observer_vote<R>(rng: &mut R) -> Vote
 where
     R: Rng + ?Sized,
 {
-    match role {
-        Role::Absent => vec![Vote::Absent],
-        Role::Honest => {
-            let primary = if rng.random::<f64>() < HONEST_MAIN_BLOCK_VOTE_PROBABILITY {
-                Vote::Block(main_block)
-            } else {
-                // Split the remaining probability evenly between the other
-                // three blocks and skip, without selecting the main block again.
-                let alternative = rng.random_range(0..BLOCKS_PER_SLOT);
-                if alternative == BLOCKS_PER_SLOT - 1 {
-                    Vote::Skip
-                } else {
-                    Vote::Block((main_block + alternative + 1) % BLOCKS_PER_SLOT)
+    match rng.random_range(0..BLOCKS_PER_SLOT + 1) {
+        0 => Vote::Skip,
+        block => Vote::Block(block - 1),
+    }
+}
+
+fn generate_vote_set<R>(rng: &mut R) -> Vec<Vote>
+where
+    R: Rng + ?Sized,
+{
+    // `absent` is its own grammar alternative. Every other validator gets an unrestricted
+    // sequence of one to five vote targets, including duplicates and conflicting vote types.
+    if rng.random_range(0..11) == 0 {
+        return vec![Vote::Absent];
+    }
+    let count = rng.random_range(1..=MAX_VOTES_PER_VALIDATOR);
+    (0..count)
+        .map(|_| match rng.random_range(0..BLOCKS_PER_SLOT * 2 + 2) {
+            block @ 0..=3 => Vote::Block(block),
+            block @ 4..=7 => Vote::NotarFallback(block - BLOCKS_PER_SLOT),
+            8 => Vote::Skip,
+            9 => Vote::SkipFallback,
+            _ => unreachable!(),
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct SimulatedVoteHistory {
+    notarize: Option<usize>,
+    notarize_fallback: Vec<usize>,
+    skip: bool,
+    skip_fallback: bool,
+}
+
+impl SimulatedVoteHistory {
+    fn accept_primary(&mut self, vote: Vote) -> Option<Vote> {
+        match vote {
+            Vote::Absent => None,
+            Vote::Block(block) => {
+                if self.skip || self.notarize.is_some() || self.notarize_fallback.contains(&block) {
+                    return None;
                 }
-            };
-            if rng.random::<f64>() >= HONEST_FALLBACK_VOTE_PROBABILITY {
-                return vec![primary];
+                self.notarize = Some(block);
+                Some(vote)
             }
-            let fallback = match primary {
-                Vote::Skip => Vote::NotarFallback(rng.random_range(0..BLOCKS_PER_SLOT)),
-                Vote::Block(_) => Vote::SkipFallback,
-                Vote::Absent | Vote::NotarFallback(_) | Vote::SkipFallback => unreachable!(),
-            };
-            vec![primary, fallback]
-        }
-        Role::Byzantine => {
-            let mut votes = [
-                Vote::Block(0),
-                Vote::Block(1),
-                Vote::Block(2),
-                Vote::Block(3),
-                Vote::Skip,
-            ];
-            votes.shuffle(rng);
-            votes[..rng.random_range(2..=votes.len())].to_vec()
+            Vote::Skip => {
+                if self.skip || self.skip_fallback || self.notarize.is_some() {
+                    return None;
+                }
+                self.skip = true;
+                Some(vote)
+            }
+            Vote::NotarFallback(block) => {
+                if self.notarize == Some(block)
+                    || self.notarize_fallback.contains(&block)
+                    || self.notarize_fallback.len() >= 3
+                {
+                    return None;
+                }
+                self.notarize_fallback.push(block);
+                None
+            }
+            Vote::SkipFallback => {
+                if self.skip || self.skip_fallback {
+                    return None;
+                }
+                self.skip_fallback = true;
+                None
+            }
         }
     }
 }
@@ -738,73 +656,75 @@ fn simulate_round2(
         if observer_already_skipped && validator == 0 {
             continue;
         }
-        let accepted_vote = votes[0];
-        if accepted_vote == Vote::Absent {
-            continue;
-        }
-        if validator == 0 {
-            observer_vote = Some(accepted_vote);
-            match accepted_vote {
-                Vote::Block(block) => emitted.push(Round2Vote::Notarize(block)),
-                Vote::Skip => {
-                    bad_window = true;
-                    skips_rest_of_window = true;
+        let mut history = SimulatedVoteHistory::default();
+        for &vote in votes {
+            let Some(accepted_vote) = history.accept_primary(vote) else {
+                continue;
+            };
+            if validator == 0 {
+                observer_vote = Some(accepted_vote);
+                match accepted_vote {
+                    Vote::Block(block) => emitted.push(Round2Vote::Notarize(block)),
+                    Vote::Skip => {
+                        bad_window = true;
+                        skips_rest_of_window = true;
+                    }
+                    Vote::Absent | Vote::NotarFallback(_) | Vote::SkipFallback => unreachable!(),
                 }
+            }
+            match accepted_vote {
+                Vote::Block(block) => block_counts[block] += 1,
+                Vote::Skip => skip_count += 1,
                 Vote::Absent | Vote::NotarFallback(_) | Vote::SkipFallback => unreachable!(),
             }
-        }
-        match accepted_vote {
-            Vote::Block(block) => block_counts[block] += 1,
-            Vote::Skip => skip_count += 1,
-            Vote::Absent | Vote::NotarFallback(_) | Vote::SkipFallback => unreachable!(),
-        }
 
-        let Some(observer_vote) = observer_vote else {
-            continue;
-        };
-        for block in 0..BLOCKS_PER_SLOT {
-            let safe_to_notar = !safe_to_notar_sent[block]
-                && observer_vote != Vote::Block(block)
-                && (block_counts[block] >= SAFE_VALIDATORS
-                    || (block_counts[block] >= MIN_NOTARIZE_VALIDATORS
-                        && skip_count + block_counts[block] >= QUORUM_VALIDATORS));
-            if !safe_to_notar {
+            let Some(observer_vote) = observer_vote else {
                 continue;
+            };
+            for block in 0..BLOCKS_PER_SLOT {
+                let safe_to_notar = !safe_to_notar_sent[block]
+                    && observer_vote != Vote::Block(block)
+                    && (block_counts[block] >= SAFE_VALIDATORS
+                        || (block_counts[block] >= MIN_NOTARIZE_VALIDATORS
+                            && skip_count + block_counts[block] >= QUORUM_VALIDATORS));
+                if !safe_to_notar {
+                    continue;
+                }
+                safe_to_notar_sent[block] = true;
+                skips_rest_of_window = true;
+                if first_in_leader_window {
+                    if !its_over {
+                        emitted.push(Round2Vote::NotarFallback(block));
+                        bad_window = true;
+                    }
+                } else {
+                    pending_safe_to_notar.push(block);
+                }
             }
-            safe_to_notar_sent[block] = true;
-            skips_rest_of_window = true;
-            if first_in_leader_window {
+
+            let total_notarized = block_counts.iter().sum::<usize>();
+            let top_notarized = block_counts.iter().copied().max().unwrap_or_default();
+            let safe_to_skip = !safe_to_skip_sent
+                && matches!(observer_vote, Vote::Block(_))
+                && skip_count + total_notarized - top_notarized >= SAFE_VALIDATORS;
+            if safe_to_skip {
+                safe_to_skip_sent = true;
+                skips_rest_of_window = true;
                 if !its_over {
-                    emitted.push(Round2Vote::NotarFallback(block));
+                    emitted.push(Round2Vote::SkipFallback);
                     bad_window = true;
                 }
-            } else {
-                pending_safe_to_notar.push(block);
             }
-        }
 
-        let total_notarized = block_counts.iter().sum::<usize>();
-        let top_notarized = block_counts.iter().copied().max().unwrap_or_default();
-        let safe_to_skip = !safe_to_skip_sent
-            && matches!(observer_vote, Vote::Block(_))
-            && skip_count + total_notarized - top_notarized >= SAFE_VALIDATORS;
-        if safe_to_skip {
-            safe_to_skip_sent = true;
-            skips_rest_of_window = true;
-            if !its_over {
-                emitted.push(Round2Vote::SkipFallback);
-                bad_window = true;
+            if let Vote::Block(block) = accepted_vote
+                && block_counts[block] == QUORUM_VALIDATORS
+                && observer_vote == Vote::Block(block)
+                && !bad_window
+                && !its_over
+            {
+                emitted.push(Round2Vote::Finalize);
+                its_over = true;
             }
-        }
-
-        if let Vote::Block(block) = accepted_vote
-            && block_counts[block] == QUORUM_VALIDATORS
-            && observer_vote == Vote::Block(block)
-            && !bad_window
-            && !its_over
-        {
-            emitted.push(Round2Vote::Finalize);
-            its_over = true;
         }
     }
 
@@ -818,16 +738,6 @@ fn simulate_round2(
         emitted.push(Round2Vote::None);
     }
     (emitted, skips_rest_of_window)
-}
-
-fn infer_role(votes: &[Vote]) -> Role {
-    match votes {
-        [Vote::Absent] => Role::Absent,
-        [Vote::Block(_) | Vote::Skip]
-        | [Vote::Skip, Vote::NotarFallback(_)]
-        | [Vote::Block(_), Vote::SkipFallback] => Role::Honest,
-        _ => Role::Byzantine,
-    }
 }
 
 fn render_votes(output: &mut String, votes: &[Vote]) {
