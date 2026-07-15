@@ -3,15 +3,18 @@
 use fandango::{
     Fandango,
     generation::Generator,
-    typing::{AsNodeRef, Downcast, Node, Opaque},
-    visitor::{VisitResult, VisitableChildren, Visitor, write::WriteVisitor},
+    typing::{AsNodeRef, Downcast, Node, Opaque, Structured},
+    visitor::{VisitResult, VisitableChildren, Visitor, kpath::KPaths, write::WriteVisitor},
 };
 use rand::{Rng, SeedableRng, seq::SliceRandom};
 use std::{
     collections::{HashSet, VecDeque},
     convert::Infallible,
     fmt::Write as _,
+    fs, io,
+    num::NonZeroUsize,
     ops::ControlFlow,
+    path::Path,
 };
 
 const NUM_SLOTS: usize = 32;
@@ -19,7 +22,7 @@ const VALIDATOR_COUNT: usize = 100;
 const BYZANTINE_VALIDATORS: usize = 19;
 const MAX_ABSENT_VALIDATORS: usize = 20;
 const BLOCKS_PER_SLOT: usize = 4;
-const HONEST_BLOCK_VOTE_PROBABILITY: f64 = 0.90;
+const HONEST_MAIN_BLOCK_VOTE_PROBABILITY: f64 = 0.70;
 const HONEST_FALLBACK_VOTE_PROBABILITY: f64 = 0.50;
 const QUORUM_VALIDATORS: usize = 60;
 const SAFE_VALIDATORS: usize = 40;
@@ -97,10 +100,11 @@ impl Scenario {
             }
 
             let block_ids = generate_block_ids(rng, &mut used_block_ids);
+            let main_block = rng.random_range(0..BLOCKS_PER_SLOT);
             let mut round1 = roles
                 .iter()
                 .copied()
-                .map(|role| generate_vote_set(rng, role))
+                .map(|role| generate_vote_set(rng, role, main_block))
                 .collect::<Vec<_>>();
 
             // v1's fallback behavior is the oracle output, not a round-one input.
@@ -450,6 +454,181 @@ where
         .expect("AlpenglowGenerator always handles the root node")
 }
 
+/// Persistent k-path coverage for generated Alpenglow trees.
+pub struct KPathCoverage {
+    paths: KPaths,
+    covered: HashSet<Vec<usize>>,
+}
+
+/// Collect paths from the realized tree instead of looking them up while walking it.
+///
+/// `KPaths` currently omits some valid paths involving repeated grouped expressions from its
+/// precomputed lookup. `KPathUpdate` consequently panics on such a tree. Keeping collection
+/// independent of that lookup lets coverage include those paths while retaining the
+/// grammar-derived lookup as the initial coverage universe.
+struct RealizedKPathCollector {
+    k: usize,
+    stack: Vec<usize>,
+    paths: HashSet<Vec<usize>>,
+}
+
+impl RealizedKPathCollector {
+    fn new(k: NonZeroUsize) -> Self {
+        Self {
+            k: k.get(),
+            stack: Vec::new(),
+            paths: HashSet::new(),
+        }
+    }
+}
+
+impl<T> Visitor<T> for RealizedKPathCollector
+where
+    T: VisitableChildren<T>,
+{
+    type Continue = Self;
+    type Break = Infallible;
+    type Error = Infallible;
+
+    fn visit<'program, N>(mut self, node: &'program N, _index: usize) -> VisitResult<Self, T>
+    where
+        N: Node<Type<'program> = T>,
+        T: From<&'program N> + AsNodeRef<N>,
+    {
+        self.stack.push(node.discriminant());
+        let first = self.stack.len().saturating_sub(self.k);
+        for offset in first..self.stack.len() {
+            self.paths.insert(self.stack[offset..].to_vec());
+        }
+        let mut collector = node
+            .opaque()
+            .visit_each(self)
+            .unwrap()
+            .continue_value()
+            .unwrap();
+        collector.stack.pop();
+        Ok(ControlFlow::Continue(collector))
+    }
+}
+
+impl KPathCoverage {
+    /// Load coverage from `state`, or create an empty state if the file does not exist.
+    pub fn load(k: NonZeroUsize, state: Option<&Path>) -> io::Result<Self> {
+        let mut coverage = Self {
+            paths: KPaths::new::<TypeMut<'static>>(k, nonterminal_start::ROOT.inner()),
+            covered: HashSet::new(),
+        };
+        let Some(state) = state else {
+            return Ok(coverage);
+        };
+        let input = match fs::read_to_string(state) {
+            Ok(input) => input,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(coverage),
+            Err(error) => return Err(error),
+        };
+        let mut lines = input.lines();
+        if lines.next() != Some("fandango-kpath-v1") {
+            return Err(invalid_coverage_state("invalid state header"));
+        }
+        let stored_k = lines
+            .next()
+            .and_then(|line| line.strip_prefix("k="))
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| invalid_coverage_state("invalid k value"))?;
+        if stored_k != k.get() {
+            return Err(invalid_coverage_state(format!(
+                "state uses k={stored_k}, requested k={}",
+                k.get()
+            )));
+        }
+        let stored_grammar = lines
+            .next()
+            .and_then(|line| line.strip_prefix("grammar="))
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+            .ok_or_else(|| invalid_coverage_state("invalid grammar fingerprint"))?;
+        if stored_grammar != grammar_fingerprint() {
+            return Err(invalid_coverage_state(
+                "state belongs to a different Alpenglow grammar",
+            ));
+        }
+
+        for line in lines.filter(|line| !line.is_empty()) {
+            let path = line
+                .split(',')
+                .map(|value| {
+                    value.parse::<usize>().map_err(|error| {
+                        invalid_coverage_state(format!("invalid path {line:?}: {error}"))
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            if path.is_empty() || path.len() > k.get() {
+                return Err(invalid_coverage_state(format!(
+                    "invalid grammar path: {line}"
+                )));
+            }
+            coverage.covered.insert(path);
+        }
+        Ok(coverage)
+    }
+
+    /// Record every k-path present in a generated tree.
+    pub fn observe(&mut self, tree: &nonterminal_start) {
+        let collector = RealizedKPathCollector::new(self.paths.k())
+            .visit(tree, 0)
+            .unwrap()
+            .continue_value()
+            .unwrap();
+        self.covered.extend(collector.paths);
+    }
+
+    /// Return `(covered, total)` for this grammar and k.
+    pub fn totals(&self) -> (usize, usize) {
+        let total = self
+            .paths
+            .lookup()
+            .keys()
+            .map(|path| path.to_vec())
+            .chain(self.covered.iter().cloned())
+            .collect::<HashSet<_>>()
+            .len();
+        (self.covered.len(), total)
+    }
+
+    /// Persist the covered path set.
+    pub fn save(&self, state: &Path) -> io::Result<()> {
+        let mut paths = self.covered.iter().collect::<Vec<_>>();
+        paths.sort();
+        let mut output = format!(
+            "fandango-kpath-v1\nk={}\ngrammar={:016x}\n",
+            self.paths.k().get(),
+            grammar_fingerprint()
+        );
+        for path in paths {
+            for (index, discriminant) in path.iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                write!(output, "{discriminant}").unwrap();
+            }
+            output.push('\n');
+        }
+        let temporary = state.with_extension("tmp");
+        fs::write(&temporary, output)?;
+        fs::rename(temporary, state)
+    }
+}
+
+fn invalid_coverage_state(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn grammar_fingerprint() -> u64 {
+    // FNV-1a is sufficient here: this identifies stale state, not hostile input.
+    GRAMMAR.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 fn validate_tree(tree: &nonterminal_start) -> Result<(), Vec<String>> {
     let visitor = ConstraintVisitor::default()
         .visit(tree, 0)
@@ -495,17 +674,24 @@ where
     })
 }
 
-fn generate_vote_set<R>(rng: &mut R, role: Role) -> Vec<Vote>
+fn generate_vote_set<R>(rng: &mut R, role: Role, main_block: usize) -> Vec<Vote>
 where
     R: Rng + ?Sized,
 {
     match role {
         Role::Absent => vec![Vote::Absent],
         Role::Honest => {
-            let primary = if rng.random::<f64>() < HONEST_BLOCK_VOTE_PROBABILITY {
-                Vote::Block(rng.random_range(0..BLOCKS_PER_SLOT))
+            let primary = if rng.random::<f64>() < HONEST_MAIN_BLOCK_VOTE_PROBABILITY {
+                Vote::Block(main_block)
             } else {
-                Vote::Skip
+                // Split the remaining probability evenly between the other
+                // three blocks and skip, without selecting the main block again.
+                let alternative = rng.random_range(0..BLOCKS_PER_SLOT);
+                if alternative == BLOCKS_PER_SLOT - 1 {
+                    Vote::Skip
+                } else {
+                    Vote::Block((main_block + alternative + 1) % BLOCKS_PER_SLOT)
+                }
             };
             if rng.random::<f64>() >= HONEST_FALLBACK_VOTE_PROBABILITY {
                 return vec![primary];

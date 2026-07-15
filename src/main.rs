@@ -20,6 +20,7 @@ use std::{
     fmt, fs,
     fs::File,
     io::{self, Write},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -43,6 +44,8 @@ struct FuzzArgs {
     count: usize,
     seed: u64,
     output: Option<PathBuf>,
+    k_path: Option<NonZeroUsize>,
+    coverage_state: Option<PathBuf>,
 }
 
 fn main() {
@@ -96,6 +99,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
     let mut count = 1usize;
     let mut seed = None;
     let mut output = None;
+    let mut k_path = None;
+    let mut coverage_state = None;
 
     while let Some(arg) = args.next() {
         match arg.to_string_lossy().as_ref() {
@@ -131,6 +136,25 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
                 };
                 output = Some(PathBuf::from(value));
             }
+            "--k-path" => {
+                let Some(value) = args.next() else {
+                    return Err(cli_error("missing value for --k-path"));
+                };
+                let parsed = value
+                    .to_string_lossy()
+                    .parse::<usize>()
+                    .map_err(|error| cli_error(format!("invalid k {:?}: {error}", value)))?;
+                k_path = Some(
+                    NonZeroUsize::new(parsed)
+                        .ok_or_else(|| cli_error("--k-path must be greater than zero"))?,
+                );
+            }
+            "--coverage-state" => {
+                let Some(value) = args.next() else {
+                    return Err(cli_error("missing value for --coverage-state"));
+                };
+                coverage_state = Some(PathBuf::from(value));
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => {
                 return Err(cli_error(format!("unknown argument {other:?}\n\n{USAGE}")));
@@ -139,6 +163,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
     }
 
     let file = file.ok_or_else(|| cli_error("missing required -f/--file argument"))?;
+    if coverage_state.is_some() && k_path.is_none() {
+        return Err(cli_error("--coverage-state requires --k-path"));
+    }
     let seed = match seed {
         Some(seed) => seed,
         None => current_time_seed()?,
@@ -148,6 +175,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
         count,
         seed,
         output,
+        k_path,
+        coverage_state,
     }))
 }
 
@@ -178,11 +207,39 @@ fn fuzz_to(args: &FuzzArgs, output: &mut dyn Write) -> Result<()> {
                 args.file.display()
             )));
         }
+        let mut coverage = args
+            .k_path
+            .map(|k| alpenglow::KPathCoverage::load(k, args.coverage_state.as_deref()))
+            .transpose()?;
         for _ in 0..args.count {
             let node = alpenglow::generate_tree(&mut rng);
+            if let Some(coverage) = coverage.as_mut() {
+                coverage.observe(&node);
+            }
             write_node(&node, output)?;
         }
+        if let Some(coverage) = coverage {
+            if let Some(state) = args.coverage_state.as_deref() {
+                coverage.save(state)?;
+            }
+            let (covered, total) = coverage.totals();
+            let percentage = if total == 0 {
+                0.0
+            } else {
+                covered as f64 / total as f64 * 100.0
+            };
+            eprintln!(
+                "k-path({}): {covered}/{total} ({percentage:.2}%)",
+                args.k_path.unwrap()
+            );
+        }
         return Ok(());
+    }
+
+    if args.k_path.is_some() {
+        return Err(cli_error(
+            "k-path reporting is currently available only for alpenglow-simpler.fan",
+        ));
     }
 
     let program = parse_owned_program(source)
@@ -255,11 +312,15 @@ fn cli_error(message: impl Into<String>) -> Box<dyn Error> {
 const USAGE: &str = "\
 Usage:
   fandango-rs -f <grammar.fan> [--count N] [--seed SEED] [--output PATH]
-  fandango-rs fuzz -f <grammar.fan> [--count N] [--seed SEED] [--output PATH]
+              [--k-path K] [--coverage-state PATH]
+  fandango-rs fuzz -f <grammar.fan> [options]
 
 Options:
   -f, --file <path>   Fandango grammar file to generate from
   -n, --count <N>     Number of samples to print [default: 1]
   -s, --seed <SEED>   Deterministic RNG seed [default: current Unix time in milliseconds]
   -o, --output <path> Write generated samples to a file [default: stdout]
+      --k-path <K>     Measure cumulative grammar k-path coverage
+      --coverage-state <path>
+                         Persist k-path coverage across invocations
   -h, --help          Print this help text";
