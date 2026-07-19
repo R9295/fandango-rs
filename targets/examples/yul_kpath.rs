@@ -29,14 +29,14 @@ use fandango::generation::Generated;
 use fandango::tuple_list::tuple_list;
 use fandango::typing::Structured;
 use fandango::visitor::Visitor;
+use fandango::visitor::VisitorMut;
 use fandango::visitor::write::WriteVisitor;
 use fandango_core::visitor::kpath::{KPathUpdate, KPaths};
 use fandango_runtime::operators::DepthLimiter;
-use fandango_targets::yul::{self, TypeMut, nonterminal_start};
+use fandango_targets::yul::{self, ScopeFixer, TypeMut, nonterminal_start};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::collections::HashSet;
-use std::io::Write;
 use std::num::NonZeroUsize;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -101,20 +101,21 @@ fn evm_available() -> bool {
 /// Errors writing to the child's stdin (e.g. a broken pipe when `solc` bails out early on
 /// a parse error) are ignored — the exit status is the authoritative verdict.
 fn solc_compile(source: &str) -> Result<String, String> {
-    let child = Command::new("solc")
-        .args(["--strict-assembly", "--bin", "-"])
-        .stdin(Stdio::piped())
+    // Write to a temp file rather than piping stdin: the `solc` on PATH may be a Python
+    // shim (solc-select) that deadlocks on piped stdin.
+    let path = std::env::temp_dir().join("yul_kpath_oracle.yul");
+    if let Err(e) = std::fs::write(&path, source) {
+        return Err(format!("failed to write temp file: {e}"));
+    }
+    let output = Command::new("solc")
+        .arg("--strict-assembly")
+        .arg("--bin")
+        .arg(&path)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) => return Err(format!("failed to spawn solc: {e}")),
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(source.as_bytes());
-    }
-    let output = match child.wait_with_output() {
+        .output();
+    let output = match output {
         Ok(o) => o,
         Err(e) => return Err(format!("failed to run solc: {e}")),
     };
@@ -204,9 +205,18 @@ fn main() -> Result<(), Error> {
     }
 
     // The generator walks the grammar structure, bounded so recursive productions
-    // terminate.
-    let generator = DepthLimiter::new(yul::STRUCTURE.inner(), 100);
+    // terminate. Depth is kept modest so the recursive visitors don't overflow the
+    // stack on deeply nested trees.
+    let generator = DepthLimiter::new(yul::STRUCTURE.inner(), 30);
     let mut generators = tuple_list!(generator);
+
+    // Size window. Unfiltered generation is ~50% trivial `{ let _x }` with a heavy tail
+    // of giant programs — the signature of a near-critical branching process — so we
+    // resample both ends and keep the substantive middle.
+    const MIN_CHARS: usize = 40;
+    const MAX_CHARS: usize = 400;
+    const MAX_TRIES: usize = 40;
+    println!("size window: {MIN_CHARS}..={MAX_CHARS} chars (resampled, max {MAX_TRIES} tries)");
 
     // Build the k-path universe directly from the grammar graph.
     let mut kpaths = KPaths::new::<TypeMut<'static>>(k, nonterminal_start::ROOT.inner());
@@ -230,9 +240,25 @@ fn main() -> Result<(), Error> {
     let mut first_valid: Option<(String, String, String)> = None; // (yul, bytecode, evm outcome)
     let mut first_invalid: Option<(String, String)> = None; // (yul, solc diagnostic)
 
+    let mut resampled = 0usize;
     for i in 1..=samples {
-        let program = nonterminal_start::generate(&mut sampler, &mut generators, 0);
-        let source = to_source(&program)?;
+        // Generate, repair variable scope, and keep only programs inside the size window;
+        // anything trivial or gigantic is thrown away and resampled.
+        let (program, source) = {
+            let mut tries = 0usize;
+            loop {
+                let mut candidate =
+                    nonterminal_start::generate(&mut sampler, &mut generators, 0);
+                let _ =
+                    ScopeFixer::new(&mut sampler, &mut generators).visit_mut(&mut candidate, 0);
+                let rendered = to_source(&candidate)?;
+                tries += 1;
+                if (MIN_CHARS..=MAX_CHARS).contains(&rendered.len()) || tries >= MAX_TRIES {
+                    resampled += tries - 1;
+                    break (candidate, rendered);
+                }
+            }
+        };
         if !debug && i <= 2 {
             println!("--- sample #{i} ({} chars) ---\n{source}", source.len());
         }
@@ -332,6 +358,11 @@ fn main() -> Result<(), Error> {
         "Covered {covered} of {total} {k}-paths ({:.2}%) from {samples} programs \
          ({total_len} chars of Yul total).",
         percent(covered, total)
+    );
+    println!(
+        "Size filter: kept {samples} in {MIN_CHARS}..={MAX_CHARS} chars, discarded {resampled} \
+         out-of-window candidates (avg {:.0} chars/program).",
+        total_len as f64 / samples as f64
     );
 
     if solc_on {
