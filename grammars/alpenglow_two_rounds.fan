@@ -11,8 +11,8 @@
 
 <slot> ::= <block_catalog>
     "slot\n"
-    "  round1:" <round_assignment>+ "\n"
-    "  round2:" <round_assignment>+ "\n"
+    "  round1: v1=" <round1_v1_vote> <round_assignment>+ "\n"
+    "  round2: v1=" <vote> <round_assignment>+ "\n"
     "end-slot\n" ;
 
 <block_catalog> ::= "blocks:\n"
@@ -28,9 +28,11 @@
 <hex_digit> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7"
     | "8" | "9" | "a" | "b" | "c" | "d" | "e" | "f" ;
 
-<round_assignment> ::= " " <validator_name> "=" <vote> ;
+<round_assignment> ::= " " <validator_name> "=" <vote_set> ;
+<vote_set> ::= "absent" | <vote> ("," <vote>)* ;
 <vote> ::= "skip-fallback" | "skip" | "finalize" | <notarize_vote>
-    | <notarize_fallback_vote> | "absent" ;
+    | <notarize_fallback_vote> ;
+<round1_v1_vote> ::= "skip" | <notarize_vote> ;
 <notarize_vote> ::= "notarize(" <block_reference> ")" ;
 <notarize_fallback_vote> ::= "notarizefallback(" <block_reference> ")" ;
 <block_reference> ::= "b1" | "b2" | "b3" | "b4" ;

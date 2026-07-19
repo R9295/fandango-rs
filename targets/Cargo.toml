@@ -9,9 +9,11 @@ publish = false
 default = ["static_defs"]
 
 csv = []
+evm = []
 rest = []
 scriptsizec = []
 xml = []
+yul = []
 clang = []
 
 static_defs = []
@@ -47,3 +49,13 @@ required-features = ["xml", "static_defs"]
 name = "c_lang"
 path = "examples/c_lang.rs"
 required-features = ["clang", "static_defs"]
+
+[[example]]
+name = "evm_kpath"
+path = "examples/evm_kpath.rs"
+required-features = ["evm", "static_defs"]
+
+[[example]]
+name = "yul_kpath"
+path = "examples/yul_kpath.rs"
+required-features = ["yul", "static_defs"]

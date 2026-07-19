@@ -44,9 +44,13 @@ macro_rules! maybe_deref_mut {
 pub mod clang;
 #[cfg(feature = "csv")]
 pub mod csv;
+#[cfg(feature = "evm")]
+pub mod evm;
 #[cfg(feature = "rest")]
 pub mod rest;
 #[cfg(feature = "scriptsizec")]
 pub mod scriptsizec;
 #[cfg(feature = "xml")]
 pub mod xml;
+#[cfg(feature = "yul")]
+pub mod yul;

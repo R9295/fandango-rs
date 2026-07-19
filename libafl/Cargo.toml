@@ -4,9 +4,19 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "forkserver_fuzzer"
+path = "src/bin/forkserver_fuzzer.rs"
+required-features = ["std"]
+
 [features]
 default = ["std"]
-std = ["libafl/std", "libafl_bolts/std", "libafl_bolts/serdeany_autoreg"]
+std = [
+    "libafl/fork",
+    "libafl/std",
+    "libafl_bolts/std",
+    "libafl_bolts/serdeany_autoreg",
+]
 
 [dependencies]
 fandango = { path = ".." }

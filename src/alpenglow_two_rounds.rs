@@ -25,6 +25,7 @@ const NUM_SLOTS: usize = 32;
 const VALIDATOR_COUNT: usize = 100;
 const BLOCKS_PER_SLOT: usize = 4;
 const BLOCK_ID_BYTES: usize = 32;
+const MAX_VOTES_PER_VALIDATOR: usize = 5;
 const TOTAL_STAKE: u64 = 10_000_000_000;
 
 /// Grammar source compiled into the static two-round Alpenglow target.
@@ -47,8 +48,8 @@ enum Vote {
 #[derive(Debug, Eq, PartialEq)]
 struct Slot {
     block_ids: [[u8; BLOCK_ID_BYTES]; BLOCKS_PER_SLOT],
-    round1: Vec<Vote>,
-    round2: Vec<Vote>,
+    round1: Vec<Vec<Vote>>,
+    round2: Vec<Vec<Vote>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -66,8 +67,8 @@ impl Scenario {
         let slots = (0..NUM_SLOTS)
             .map(|_| Slot {
                 block_ids: generate_block_ids(rng),
-                round1: generate_round(rng),
-                round2: generate_round(rng),
+                round1: generate_round1(rng),
+                round2: generate_round2(rng),
             })
             .collect();
         Self { stakes, slots }
@@ -478,32 +479,70 @@ where
     std::array::from_fn(|_| rng.random())
 }
 
-fn generate_round<R>(rng: &mut R) -> Vec<Vote>
+fn generate_round1<R>(rng: &mut R) -> Vec<Vec<Vote>>
 where
     R: Rng + ?Sized,
 {
-    (0..VALIDATOR_COUNT).map(|_| generate_vote(rng)).collect()
+    let v1_vote = if rng.random() {
+        Vote::Skip
+    } else {
+        Vote::Notarize(rng.random_range(0..BLOCKS_PER_SLOT))
+    };
+    generate_round(rng, v1_vote)
 }
 
-fn generate_vote<R>(rng: &mut R) -> Vote
+fn generate_round2<R>(rng: &mut R) -> Vec<Vec<Vote>>
 where
     R: Rng + ?Sized,
 {
-    match rng.random_range(0..6) {
+    let v1_vote = generate_non_absent_vote(rng);
+    generate_round(rng, v1_vote)
+}
+
+fn generate_round<R>(rng: &mut R, v1_vote: Vote) -> Vec<Vec<Vote>>
+where
+    R: Rng + ?Sized,
+{
+    let mut round = Vec::with_capacity(VALIDATOR_COUNT);
+    round.push(vec![v1_vote]);
+    round.extend((1..VALIDATOR_COUNT).map(|_| generate_vote_set(rng)));
+    round
+}
+
+fn generate_vote_set<R>(rng: &mut R) -> Vec<Vote>
+where
+    R: Rng + ?Sized,
+{
+    if rng.random_range(0..6) == 0 {
+        return vec![Vote::Absent];
+    }
+    let count = rng.random_range(1..=MAX_VOTES_PER_VALIDATOR);
+    (0..count).map(|_| generate_non_absent_vote(rng)).collect()
+}
+
+fn generate_non_absent_vote<R>(rng: &mut R) -> Vote
+where
+    R: Rng + ?Sized,
+{
+    match rng.random_range(0..5) {
         0 => Vote::Skip,
         1 => Vote::Finalize,
         2 => Vote::Notarize(rng.random_range(0..BLOCKS_PER_SLOT)),
         3 => Vote::NotarizeFallback(rng.random_range(0..BLOCKS_PER_SLOT)),
         4 => Vote::SkipFallback,
-        5 => Vote::Absent,
         _ => unreachable!(),
     }
 }
 
-fn render_round(output: &mut String, votes: &[Vote]) {
-    for (validator, vote) in votes.iter().enumerate() {
+fn render_round(output: &mut String, vote_sets: &[Vec<Vote>]) {
+    for (validator, votes) in vote_sets.iter().enumerate() {
         write!(output, " v{}=", validator + 1).unwrap();
-        render_vote(output, *vote);
+        for (index, vote) in votes.iter().enumerate() {
+            if index != 0 {
+                output.push(',');
+            }
+            render_vote(output, *vote);
+        }
     }
 }
 
@@ -520,7 +559,7 @@ fn render_vote(output: &mut String, vote: Vote) {
     }
 }
 
-fn parse_round(line: &str, prefix: &str) -> Result<Vec<Vote>, String> {
+fn parse_round(line: &str, prefix: &str) -> Result<Vec<Vec<Vote>>, String> {
     let assignments = line
         .strip_prefix(prefix)
         .ok_or_else(|| format!("invalid round line: {line:?}"))?
@@ -541,7 +580,21 @@ fn parse_round(line: &str, prefix: &str) -> Result<Vec<Vote>, String> {
         if name != format!("v{}", validator + 1) {
             return Err(format!("round validators are out of order at {name:?}"));
         }
-        votes.push(parse_vote(encoded_vote)?);
+        votes.push(parse_vote_set(encoded_vote)?);
+    }
+    Ok(votes)
+}
+
+fn parse_vote_set(encoded: &str) -> Result<Vec<Vote>, String> {
+    let votes = encoded
+        .split(',')
+        .map(parse_vote)
+        .collect::<Result<Vec<_>, _>>()?;
+    if votes.is_empty()
+        || votes.len() > MAX_VOTES_PER_VALIDATOR
+        || (votes.contains(&Vote::Absent) && votes.as_slice() != [Vote::Absent])
+    {
+        return Err(format!("invalid vote set: {encoded:?}"));
     }
     Ok(votes)
 }
@@ -580,22 +633,57 @@ fn parse_block_number(encoded: &str) -> Result<usize, String> {
     Ok(number - 1)
 }
 
-fn validate_round(logical_slot: usize, round: usize, votes: &[Vote], violations: &mut Vec<String>) {
-    if votes.len() != VALIDATOR_COUNT {
+fn validate_round(
+    logical_slot: usize,
+    round: usize,
+    vote_sets: &[Vec<Vote>],
+    violations: &mut Vec<String>,
+) {
+    if vote_sets.len() != VALIDATOR_COUNT {
         violations.push(format!(
             "slot {logical_slot} round {round} has {} assignments, expected {VALIDATOR_COUNT}",
-            votes.len()
+            vote_sets.len()
         ));
     }
-    for vote in votes {
-        match vote {
-            Vote::Notarize(block) | Vote::NotarizeFallback(block) if *block >= BLOCKS_PER_SLOT => {
-                violations.push(format!(
-                    "slot {logical_slot} round {round} references block {}",
-                    block + 1
-                ));
+    if vote_sets
+        .first()
+        .is_none_or(|votes| votes.len() != 1 || votes.contains(&Vote::Absent))
+    {
+        violations.push(format!(
+            "slot {logical_slot} round {round} requires exactly one non-absent vote from v1"
+        ));
+    }
+    if round == 1
+        && vote_sets
+            .first()
+            .is_none_or(|votes| !matches!(votes.as_slice(), [Vote::Skip | Vote::Notarize(_)]))
+    {
+        violations.push(format!(
+            "slot {logical_slot} round 1 requires v1 to vote notarize or skip"
+        ));
+    }
+    for (validator, votes) in vote_sets.iter().enumerate() {
+        if votes.is_empty()
+            || votes.len() > MAX_VOTES_PER_VALIDATOR
+            || (votes.contains(&Vote::Absent) && votes.as_slice() != [Vote::Absent])
+        {
+            violations.push(format!(
+                "slot {logical_slot} round {round} has an invalid vote set for v{}",
+                validator + 1
+            ));
+        }
+        for vote in votes {
+            match vote {
+                Vote::Notarize(block) | Vote::NotarizeFallback(block)
+                    if *block >= BLOCKS_PER_SLOT =>
+                {
+                    violations.push(format!(
+                        "slot {logical_slot} round {round} references block {}",
+                        block + 1
+                    ));
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 }
@@ -650,6 +738,35 @@ mod tests {
         assert_eq!(scenario.slots.len(), NUM_SLOTS);
         assert!(scenario.slots.iter().all(|slot| {
             slot.round1.len() == VALIDATOR_COUNT && slot.round2.len() == VALIDATOR_COUNT
+        }));
+        assert!(scenario.slots.iter().all(|slot| {
+            [&slot.round1, &slot.round2]
+                .into_iter()
+                .all(|round| round[0].len() == 1 && round[0][0] != Vote::Absent)
+        }));
+        assert!(
+            scenario
+                .slots
+                .iter()
+                .all(|slot| matches!(slot.round1[0].as_slice(), [Vote::Skip | Vote::Notarize(_)]))
+        );
+        assert!(
+            scenario
+                .slots
+                .iter()
+                .flat_map(|slot| [&slot.round1, &slot.round2])
+                .flatten()
+                .all(|votes| {
+                    !votes.is_empty()
+                        && votes.len() <= MAX_VOTES_PER_VALIDATOR
+                        && (!votes.contains(&Vote::Absent) || votes.as_slice() == [Vote::Absent])
+                })
+        );
+        assert!(scenario.slots.iter().any(|slot| {
+            slot.round1
+                .iter()
+                .chain(&slot.round2)
+                .any(|votes| votes.len() > 1)
         }));
         assert!(scenario.validate().is_empty());
     }

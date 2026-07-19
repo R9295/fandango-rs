@@ -53,7 +53,7 @@ members = [
     "baselines/rest",
     "baselines/scriptsizec",
     "baselines/xml",
-    # "libafl",
+    "libafl",
 ]
 default-members = [
     ".", "core", "derive", "targets", "generator", "runtime"
