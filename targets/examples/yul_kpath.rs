@@ -13,6 +13,8 @@
 //!   2. `evm run <bytecode>` executes that bytecode and we classify the result as
 //!      succeeded (STOP/RETURN), reverted (REVERT), or errored (invalid opcode, stack
 //!      underflow, out of gas, ...).
+//! The oracle runs on each *distinct* program once — the generator emits many duplicate
+//! inputs (mostly the empty block `{ }`), and re-checking them would bias the statistics.
 //! If `solc` is missing, only k-path coverage is reported; if `evm` is missing, only the
 //! solc validity stage runs.
 //!
@@ -33,6 +35,7 @@ use fandango_runtime::operators::DepthLimiter;
 use fandango_targets::yul::{self, TypeMut, nonterminal_start};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use std::collections::HashSet;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::process::{Command, Stdio};
@@ -185,6 +188,9 @@ fn main() -> Result<(), Error> {
         None => StdRng::from_os_rng(),
     };
 
+    // With HARNESS_DEBUG=1, echo every generated program and its compiled bytecode.
+    let debug = std::env::var("HARNESS_DEBUG").ok().as_deref() == Some("1");
+
     let solc_on = solc_available();
     // The evm execution stage needs bytecode from solc, so it is only meaningful when
     // solc is present too.
@@ -211,7 +217,10 @@ fn main() -> Result<(), Error> {
     let mut total_len = 0usize;
     let report_every = 1;
 
-    // Oracle tallies.
+    // Oracle tallies. The oracle runs on distinct programs only (deduplicated below).
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut solc_checked = 0usize;
+    let mut duplicates = 0usize;
     let mut solc_valid = 0usize;
     let mut solc_time = Duration::ZERO;
     let mut evm_success = 0usize;
@@ -224,48 +233,67 @@ fn main() -> Result<(), Error> {
     for i in 1..=samples {
         let program = nonterminal_start::generate(&mut sampler, &mut generators, 0);
         let source = to_source(&program)?;
-        if i <= 2 {
+        if !debug && i <= 2 {
             println!("--- sample #{i} ({} chars) ---\n{source}", source.len());
         }
         total_len += source.len();
 
-        // Stage 1: does solc compile this program? Stage 2: if so, does the bytecode run?
+        // Stage 1/2: solc + evm oracle. Run once per DISTINCT program — the generator
+        // emits many duplicates (mostly `{ }`) that would otherwise bias the tallies.
         if solc_on {
-            let start = Instant::now();
-            let compiled = solc_compile(&source);
-            solc_time += start.elapsed();
-            match compiled {
-                Ok(bytecode) => {
-                    solc_valid += 1;
-                    let mut outcome = String::from("not run");
-                    if evm_on && !bytecode.is_empty() {
-                        let estart = Instant::now();
-                        outcome = match evm_run(&bytecode) {
-                            EvmOutcome::Success => {
-                                evm_success += 1;
-                                "success".to_string()
-                            }
-                            EvmOutcome::Reverted => {
-                                evm_reverted += 1;
-                                "reverted".to_string()
-                            }
-                            EvmOutcome::Errored(msg) => {
-                                evm_errored += 1;
-                                format!("error ({msg})")
-                            }
-                        };
-                        evm_time += estart.elapsed();
+            if seen.insert(source.clone()) {
+                solc_checked += 1;
+                let start = Instant::now();
+                let compiled = solc_compile(&source);
+                solc_time += start.elapsed();
+                match compiled {
+                    Ok(bytecode) => {
+                        solc_valid += 1;
+                        let mut outcome = String::from("not run");
+                        if evm_on && !bytecode.is_empty() {
+                            let estart = Instant::now();
+                            outcome = match evm_run(&bytecode) {
+                                EvmOutcome::Success => {
+                                    evm_success += 1;
+                                    "success".to_string()
+                                }
+                                EvmOutcome::Reverted => {
+                                    evm_reverted += 1;
+                                    "reverted".to_string()
+                                }
+                                EvmOutcome::Errored(msg) => {
+                                    evm_errored += 1;
+                                    format!("error ({msg})")
+                                }
+                            };
+                            evm_time += estart.elapsed();
+                        }
+                        if debug {
+                            println!("[debug] #{i:>5}  yul: {source}");
+                            println!("[debug]         bytecode: 0x{bytecode}   evm: {outcome}");
+                        }
+                        if first_valid.is_none() {
+                            first_valid = Some((source.clone(), bytecode, outcome));
+                        }
                     }
-                    if first_valid.is_none() {
-                        first_valid = Some((source.clone(), bytecode, outcome));
+                    Err(diagnostic) => {
+                        if debug {
+                            println!("[debug] #{i:>5}  yul: {source}");
+                            println!("[debug]         solc rejected: {diagnostic}");
+                        }
+                        if first_invalid.is_none() {
+                            first_invalid = Some((source.clone(), diagnostic));
+                        }
                     }
                 }
-                Err(diagnostic) => {
-                    if first_invalid.is_none() {
-                        first_invalid = Some((source.clone(), diagnostic));
-                    }
+            } else {
+                duplicates += 1;
+                if debug {
+                    println!("[debug] #{i:>5}  yul: {source}   (duplicate — oracle skipped)");
                 }
             }
+        } else if debug {
+            println!("[debug] #{i:>5}  yul: {source}   (bytecode unavailable: `solc` not found)");
         }
 
         // Mark every k-path this tree walks as covered.
@@ -280,10 +308,13 @@ fn main() -> Result<(), Error> {
             let covered = total - uncovered;
             let oracle_note = if evm_on {
                 format!(
-                    "   solc {solc_valid}/{i}  evm[ok {evm_success}, rev {evm_reverted}, err {evm_errored}]"
+                    "   solc {solc_valid}/{solc_checked} distinct  evm[ok {evm_success}, rev {evm_reverted}, err {evm_errored}]"
                 )
             } else if solc_on {
-                format!("   solc-valid {solc_valid}/{i} ({:.1}%)", percent(solc_valid, i))
+                format!(
+                    "   solc-valid {solc_valid}/{solc_checked} distinct ({:.1}%)",
+                    percent(solc_valid, solc_checked)
+                )
             } else {
                 String::new()
             };
@@ -305,8 +336,13 @@ fn main() -> Result<(), Error> {
 
     if solc_on {
         println!(
-            "Valid (solc): {solc_valid} of {samples} compiled ({:.2}%), solc wall time {:.2}s.",
-            percent(solc_valid, samples),
+            "Distinct programs: {solc_checked} of {samples} generated \
+             ({duplicates} duplicates skipped)."
+        );
+        println!(
+            "Valid (solc): {solc_valid} of {solc_checked} distinct compiled ({:.2}%), \
+             solc wall time {:.2}s.",
+            percent(solc_valid, solc_checked),
             solc_time.as_secs_f64()
         );
         if evm_on {
