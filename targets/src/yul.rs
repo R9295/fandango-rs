@@ -22,15 +22,23 @@ mod defs {
 
 #[cfg(feature = "static_defs")]
 mod defs {
+    use alloc::collections::VecDeque;
     use alloc::vec::Vec;
     use anyhow::Error;
     use core::convert::Infallible;
     use core::ops::ControlFlow;
     use fandango::Fandango;
     use fandango::generation::Generated;
-    use fandango::typing::{AsNodeMut, DowncastMut, Node, Nth, OpaqueMut};
-    use fandango::visitor::{VisitMutResult, VisitableChildrenMut, VisitorMut};
+    use fandango::typing::{
+        AsNodeMut, AsNodeRef, Downcast, DowncastMut, Node, Nth, Opaque, OpaqueMut,
+    };
+    use fandango::visitor::{
+        VisitMutResult, VisitResult, VisitableChildren, VisitableChildrenMut, Visitor, VisitorMut,
+    };
     use fandango_runtime::evolvers::basic::BasicHook;
+    use fandango_runtime::measurement::Violations;
+    use fandango_runtime::operators::Checker;
+    use num_rational::Ratio;
 
     /// Base for the Yul grammar stored in yul.fan.
     #[derive(Fandango)]
@@ -154,6 +162,97 @@ mod defs {
             let fixer = ScopeFixer::new(sampler, generators);
             let _ = fixer.visit_mut(node, 0);
             Ok(())
+        }
+    }
+
+    /// A [`Visitor`] that *scores* variable scope instead of repairing it — the read-only
+    /// twin of [`ScopeFixer`], and the validity objective for multi-objective evolution.
+    ///
+    /// Every `<var_decl>` that shadows an in-scope name, and every `<var_use>` naming a
+    /// variable not in scope, is recorded as a violation at that node's path. The evolver
+    /// uses those paths to target its mutations.
+    #[derive(Debug, Default)]
+    pub struct YulConstraintVisitor {
+        path: VecDeque<usize>,
+        scopes: Vec<Vec<nonterminal_identifier>>,
+        checked: usize,
+        violations: Vec<VecDeque<usize>>,
+    }
+
+    impl YulConstraintVisitor {
+        fn in_scope(&self, name: &nonterminal_identifier) -> bool {
+            self.scopes
+                .iter()
+                .any(|frame| frame.iter().any(|declared| declared == name))
+        }
+    }
+
+    impl Checker for YulConstraintVisitor {
+        fn violations(self) -> Violations {
+            Violations::new(
+                if self.checked == 0 {
+                    Ratio::default()
+                } else {
+                    Ratio::new(self.checked - self.violations.len(), self.checked)
+                },
+                self.violations,
+            )
+        }
+    }
+
+    impl<T> Visitor<T> for YulConstraintVisitor
+    where
+        T: VisitableChildren<T>
+            + AsNodeRef<nonterminal_block>
+            + AsNodeRef<nonterminal_var_decl>
+            + AsNodeRef<nonterminal_var_use>,
+    {
+        type Continue = Self;
+        type Break = Infallible;
+        type Error = Infallible;
+
+        fn visit<'program, N>(mut self, node: &'program N, idx: usize) -> VisitResult<Self, T>
+        where
+            N: Node<Type<'program> = T>,
+            T: From<&'program N> + AsNodeRef<N>,
+        {
+            self.path.push_back(idx);
+            let visited = node.opaque();
+
+            // A block introduces a scope: push a frame, visit children, pop it.
+            if visited.downcast::<nonterminal_block>().is_some() {
+                let result = {
+                    self.scopes.push(Vec::new());
+                    visited.visit_each(self)
+                };
+                let Ok(ControlFlow::Continue(mut visitor)) = result;
+                visitor.scopes.pop();
+                visitor.path.pop_back();
+                return Ok(ControlFlow::Continue(visitor));
+            }
+
+            if let Some(decl) = visited.downcast::<nonterminal_var_decl>() {
+                let name = decl.nth::<0>().clone();
+                self.checked += 1;
+                if self.in_scope(&name) {
+                    let violation = self.path.clone(); // shadows / redeclares
+                    self.violations.push(violation);
+                } else if let Some(frame) = self.scopes.last_mut() {
+                    frame.push(name);
+                }
+            } else if let Some(used) = visited.downcast::<nonterminal_var_use>() {
+                let name = used.nth::<0>().clone();
+                self.checked += 1;
+                if !self.in_scope(&name) {
+                    let violation = self.path.clone(); // undeclared use
+                    self.violations.push(violation);
+                }
+            }
+
+            let result = visited.visit_each(self);
+            let Ok(ControlFlow::Continue(mut visitor)) = result;
+            visitor.path.pop_back();
+            Ok(ControlFlow::Continue(visitor))
         }
     }
 

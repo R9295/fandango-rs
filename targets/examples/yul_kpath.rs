@@ -25,21 +25,43 @@
 //! Defaults: `K = 2`, `SAMPLES = 2000`, `SEED` = OS entropy.
 
 use anyhow::{Context, Error, anyhow};
-use fandango::generation::Generated;
 use fandango::tuple_list::tuple_list;
-use fandango::typing::Structured;
+use fandango::typing::{Node, Structured};
 use fandango::visitor::Visitor;
-use fandango::visitor::VisitorMut;
+use fandango::visitor::navigation::CountNodes;
 use fandango::visitor::write::WriteVisitor;
 use fandango_core::visitor::kpath::{KPathUpdate, KPaths};
+use fandango_runtime::evolvers::Evolver;
+use fandango_runtime::evolvers::multi::{KPathDiversityHook, Nsga2Evolver};
+use fandango_runtime::measurement::{FitnessMeasurer, ViolationFitness};
 use fandango_runtime::operators::DepthLimiter;
-use fandango_targets::yul::{self, ScopeFixer, TypeMut, nonterminal_start};
+use fandango_runtime::population::Individual;
+use fandango_targets::yul::{self, TypeMut, YulConstraintVisitor, nonterminal_start};
+use num_rational::Ratio;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use std::cmp::Reverse;
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// Fitness driving a tree's node count toward `n` (closer = better), so the population
+/// evolves away from trivial inputs toward substantial programs.
+struct NodeGoal {
+    n: usize,
+}
+impl<'a, N> FitnessMeasurer<'a, N> for NodeGoal
+where
+    N: Node,
+{
+    type Measurement = Reverse<usize>;
+    type Error = Infallible;
+    fn evaluate(&mut self, node: &'a N) -> Result<Self::Measurement, Self::Error> {
+        Ok(Reverse(self.n.abs_diff(node.count_nodes())))
+    }
+}
 
 const USAGE: &str = "usage: yul_kpath [K] [SAMPLES] [SEED]\n  \
     K        k-path length, >= 1        [default 2]\n  \
@@ -210,18 +232,41 @@ fn main() -> Result<(), Error> {
     let generator = DepthLimiter::new(yul::STRUCTURE.inner(), 30);
     let mut generators = tuple_list!(generator);
 
-    // Size window. Unfiltered generation is ~50% trivial `{ let _x }` with a heavy tail
-    // of giant programs — the signature of a near-critical branching process — so we
-    // resample both ends and keep the substantive middle.
-    const MIN_CHARS: usize = 40;
-    const MAX_CHARS: usize = 400;
-    const MAX_TRIES: usize = 40;
-    println!("size window: {MIN_CHARS}..={MAX_CHARS} chars (resampled, max {MAX_TRIES} tries)");
+    // Two real objectives, so NSGA-II's Pareto sorting is meaningful and the population
+    // stays diverse: scope VALIDITY (violations) and SIZE (node count). Deliberately no
+    // fix hook — repairing scope would pin validity at a constant and collapse the
+    // fronts, so evolution has to find validity itself (as xml_multiobjective does).
+    const TARGET_NODES: usize = 30;
+    const POP: usize = 100;
+    const REPLICATION: usize = 120;
+    const WARMUP: usize = 12;
+
+    let mut runtime = Nsga2Evolver::new::<nonterminal_start>(
+        tuple_list!(
+            ViolationFitness::<YulConstraintVisitor>::new(),
+            NodeGoal { n: TARGET_NODES }
+        ),
+        KPathDiversityHook::new((), k),
+        POP,
+        REPLICATION,
+        Ratio::new(80, 100),
+    )
+    .expect("crossover rate must be <= 1");
+    println!(
+        "generation: NSGA-II · objectives = scope-validity + size({TARGET_NODES} nodes) \
+         · pop {POP} · {WARMUP} warm-up gens"
+    );
 
     // Build the k-path universe directly from the grammar graph.
     let mut kpaths = KPaths::new::<TypeMut<'static>>(k, nonterminal_start::ROOT.inner());
     let (_, total) = kpaths.k_paths();
     println!("grammar = grammars/yul.fan   k = {k}   total {k}-paths in grammar = {total}");
+
+    // Warm up: evolve toward the target size before harvesting samples.
+    let mut population = runtime.initial(&mut generators, &mut sampler)?;
+    for _ in 0..WARMUP {
+        population = runtime.step(&mut generators, &mut sampler, population)?;
+    }
 
     let mut updater = KPathUpdate::inserting(&mut kpaths);
     let mut total_len = 0usize;
@@ -240,25 +285,14 @@ fn main() -> Result<(), Error> {
     let mut first_valid: Option<(String, String, String)> = None; // (yul, bytecode, evm outcome)
     let mut first_invalid: Option<(String, String)> = None; // (yul, solc diagnostic)
 
-    let mut resampled = 0usize;
-    for i in 1..=samples {
-        // Generate, repair variable scope, and keep only programs inside the size window;
-        // anything trivial or gigantic is thrown away and resampled.
-        let (program, source) = {
-            let mut tries = 0usize;
-            loop {
-                let mut candidate =
-                    nonterminal_start::generate(&mut sampler, &mut generators, 0);
-                let _ =
-                    ScopeFixer::new(&mut sampler, &mut generators).visit_mut(&mut candidate, 0);
-                let rendered = to_source(&candidate)?;
-                tries += 1;
-                if (MIN_CHARS..=MAX_CHARS).contains(&rendered.len()) || tries >= MAX_TRIES {
-                    resampled += tries - 1;
-                    break (candidate, rendered);
-                }
-            }
-        };
+    // Harvest programs from the evolving population, stepping to produce more as needed.
+    // Individuals are already scope-repaired by the fix hook, so no fixer call here.
+    let mut i = 0usize;
+    'harvest: loop {
+      for ind in &population {
+        i += 1;
+        let program = ind.node();
+        let source = to_source(program)?;
         if !debug && i <= 2 {
             println!("--- sample #{i} ({} chars) ---\n{source}", source.len());
         }
@@ -324,7 +358,7 @@ fn main() -> Result<(), Error> {
 
         // Mark every k-path this tree walks as covered.
         updater = updater
-            .visit(&program, 0)
+            .visit(program, 0)
             .expect("k-path update never errors")
             .continue_value()
             .expect("k-path update never breaks");
@@ -349,6 +383,12 @@ fn main() -> Result<(), Error> {
                 percent(covered, total)
             );
         }
+
+        if i >= samples {
+            break 'harvest;
+        }
+      }
+      population = runtime.step(&mut generators, &mut sampler, population)?;
     }
 
     let (uncovered, total) = updater.kpaths().k_paths();
@@ -360,8 +400,8 @@ fn main() -> Result<(), Error> {
         percent(covered, total)
     );
     println!(
-        "Size filter: kept {samples} in {MIN_CHARS}..={MAX_CHARS} chars, discarded {resampled} \
-         out-of-window candidates (avg {:.0} chars/program).",
+        "Evolution: NSGA-II toward {TARGET_NODES} nodes, pop {POP}, {WARMUP} warm-up gens \
+         (avg {:.0} chars/program).",
         total_len as f64 / samples as f64
     );
 

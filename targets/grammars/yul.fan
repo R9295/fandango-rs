@@ -1,7 +1,6 @@
 <start> ::= <block> ;
 
-<block> ::= "{ " <block_decl> " " <statements> "}" ;
-<block_decl> ::= "let " <var_decl> ;
+<block> ::= "{ " <statements> "}" ;
 <statements> ::= <statement> " " <statements> | "" ;
 
 <statement> ::= <variable_declaration>
