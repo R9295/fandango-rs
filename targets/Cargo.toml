@@ -31,6 +31,7 @@ anyhow.workspace = true
 embedded-io.workspace = true
 hashbrown.workspace = true
 num-rational.workspace = true
+mappable-rc.workspace = true
 
 [lints]
 workspace = true

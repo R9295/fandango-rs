@@ -1,5 +1,6 @@
 //! Visitors for type trees emitted by FANDANGO's `#[derive]` implementation.
 
+pub mod altpath;
 pub mod assignment;
 pub mod error;
 pub mod kpath;

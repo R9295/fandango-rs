@@ -16,6 +16,7 @@ use core::ops::ControlFlow;
 use fandango::generation::{Generated, InPlaceGenerated, Sampler};
 use fandango::lang::FandangoNode;
 use fandango::typing::{AsNode, Node, NodeLookup};
+use fandango::visitor::altpath::{AltPathUpdate, AltPathVisit, AltPathVisitor, AltPaths};
 use fandango::visitor::kpath::{KPathUpdate, KPathVisit, KPathVisitor, KPaths};
 use fandango::visitor::navigation::{Advance, CountNodes, GoToMut};
 use fandango::visitor::{VisitWithMut, VisitableChildrenMut, Visitor, VisitorMut};
@@ -251,6 +252,117 @@ where
 impl<I, G, S> Nsga2Hook<I, G, S> for () where I: Individual {}
 
 /// A [`Nsga2Hook`] which wraps a [`BasicHook`] and optimizes diversity by rare k-paths
+/// Like [`KPathDiversityHook`], but drives population diversity with **k-alt-path**
+/// instead of k-path.
+///
+/// Alt-paths only record alternation choices, so the signal is not diluted by the
+/// nonterminal and concatenation steps that expansion always takes. That makes it a
+/// sharper diversity gradient per unit of bookkeeping: k-alt-path covers (k+1)-path with
+/// substantially fewer subdomains to store and count.
+pub struct AltPathDiversityHook<H> {
+    k: NonZeroUsize,
+    inner: H,
+}
+
+impl<H> AltPathDiversityHook<H> {
+    /// Create the hook over the provided [`BasicHook`] and with some `k`, where `k` bounds
+    /// the number of alternations a path may traverse.
+    pub fn new(inner: H, k: NonZeroUsize) -> Self {
+        Self { k, inner }
+    }
+}
+
+impl<H, N, G, S> BasicHook<N, G, S> for AltPathDiversityHook<H>
+where
+    H: BasicHook<N, G, S>,
+{
+    fn individual_created(
+        &mut self,
+        node: &mut N,
+        generators: &mut G,
+        sampler: &mut S,
+    ) -> Result<(), Error> {
+        self.inner.individual_created(node, generators, sampler)
+    }
+}
+
+impl<H, I, G, S> Nsga2Hook<I, G, S> for AltPathDiversityHook<H>
+where
+    H: BasicHook<I::Node, G, S>,
+    I: Individual,
+    I::Node: Node + AsNode,
+    for<'a> <I::Node as Node>::Type<'a>: NodeLookup,
+{
+    fn diversity_sort(&mut self, individuals: &mut [I]) {
+        struct MinObserved<T> {
+            fewest: usize,
+            phantom: PhantomData<T>,
+        }
+
+        impl<T> MinObserved<T> {
+            pub fn new() -> Self {
+                Self {
+                    fewest: usize::MAX,
+                    phantom: PhantomData,
+                }
+            }
+        }
+
+        impl<T> AltPathVisitor for MinObserved<T>
+        where
+            T: NodeLookup,
+        {
+            type Value = usize;
+            type Break = Infallible;
+            type Error = Infallible;
+
+            fn visit_path(
+                &mut self,
+                count: usize,
+                path: &Mrc<[usize]>,
+            ) -> Result<ControlFlow<Self::Break>, Self::Error> {
+                if !matches!(
+                    T::lookup_node(*path.last().unwrap()),
+                    FandangoNode::String(_)
+                ) {
+                    self.fewest = self.fewest.min(count);
+                }
+                Ok(ControlFlow::Continue(()))
+            }
+
+            fn value(self) -> Self::Value {
+                self.fewest
+            }
+        }
+
+        let FandangoNode::Program(program) = individuals[0].node().root() else {
+            panic!("The root node wasn't a program node!")
+        };
+        let mut altpaths = AltPaths::new::<<I::Node as Node>::Type<'_>>(self.k, program);
+        let mut update = AltPathUpdate::inserting(&mut altpaths);
+        for individual in individuals.iter() {
+            update = update
+                .visit(individual.node(), 0)
+                .unwrap()
+                .continue_value()
+                .unwrap();
+        }
+
+        // Individuals covering the rarest alt-path sort first.
+        individuals.sort_by_cached_key(|individual| {
+            AltPathVisit::new(
+                update.altpaths(),
+                MinObserved::<<I::Node as Node>::Type<'_>>::new(),
+            )
+            .visit(individual.node(), 0)
+            .unwrap()
+            .continue_value()
+            .unwrap()
+            .value()
+        });
+    }
+}
+
 pub struct KPathDiversityHook<H> {
     k: NonZeroUsize,
     inner: H,

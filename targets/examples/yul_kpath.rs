@@ -25,16 +25,19 @@
 //! Defaults: `K = 2`, `SAMPLES = 2000`, `SEED` = OS entropy.
 
 use anyhow::{Context, Error, anyhow};
+use fandango::lang::FandangoNode;
 use fandango::tuple_list::tuple_list;
-use fandango::typing::{Node, Structured};
-use fandango::visitor::Visitor;
+use fandango::typing::{AsNode, Node, NodeLookup, Structured};
+use fandango::visitor::{VisitableChildren, Visitor};
 use fandango::visitor::navigation::CountNodes;
 use fandango::visitor::write::WriteVisitor;
+use fandango_core::visitor::altpath::{AltPathUpdate, AltPathVisit, AltPathVisitor, AltPaths};
+use mappable_rc::Mrc;
 use fandango_core::visitor::kpath::{KPathUpdate, KPaths};
 use fandango_runtime::evolvers::Evolver;
-use fandango_runtime::evolvers::multi::{KPathDiversityHook, Nsga2Evolver};
+use fandango_runtime::evolvers::multi::{AltPathDiversityHook, Nsga2Evolver};
 use fandango_runtime::measurement::{FitnessMeasurer, ViolationFitness};
-use fandango_runtime::operators::DepthLimiter;
+use fandango_runtime::operators::{Checker, DepthLimiter};
 use fandango_runtime::population::Individual;
 use fandango_targets::yul::{self, TypeMut, YulConstraintVisitor, nonterminal_start};
 use num_rational::Ratio;
@@ -44,6 +47,7 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -60,6 +64,88 @@ where
     type Error = Infallible;
     fn evaluate(&mut self, node: &'a N) -> Result<Self::Measurement, Self::Error> {
         Ok(Reverse(self.n.abs_diff(node.count_nodes())))
+    }
+}
+
+/// Counts alt-paths that no individual has covered yet.
+struct CountNovel {
+    novel: usize,
+}
+
+impl AltPathVisitor for CountNovel {
+    type Value = usize;
+    type Break = Infallible;
+    type Error = Infallible;
+
+    fn visit_path(
+        &mut self,
+        count: usize,
+        _path: &Mrc<[usize]>,
+    ) -> Result<ControlFlow<Self::Break>, Self::Error> {
+        if count == 0 {
+            self.novel += 1;
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn value(self) -> Self::Value {
+        self.novel
+    }
+}
+
+/// Fitness rewarding individuals that reach alt-paths the population has not covered yet.
+///
+/// Deliberately **stateful**: it accumulates one [`AltPaths`] table across evaluations, so
+/// an individual is scored by how many *novel* alt-paths it contributes rather than by its
+/// absolute coverage. Absolute coverage would mostly track program size (already an
+/// objective); novelty is what actually pushes back against the population converging onto
+/// clones. Higher is better, so the measurement is a plain count, not a `Reverse`.
+struct AltPathNovelty {
+    k: NonZeroUsize,
+    seen: Option<AltPaths>,
+}
+
+impl AltPathNovelty {
+    fn new(k: NonZeroUsize) -> Self {
+        Self { k, seen: None }
+    }
+}
+
+impl<'a, N> FitnessMeasurer<'a, N> for AltPathNovelty
+where
+    N: Node + AsNode + 'a,
+    for<'b> N::Type<'b>: NodeLookup + VisitableChildren<N::Type<'b>>,
+{
+    type Measurement = usize;
+    type Error = Error;
+
+    fn evaluate(&mut self, node: &'a N) -> Result<Self::Measurement, Self::Error> {
+        let k = self.k;
+        let table = match self.seen.as_mut() {
+            Some(t) => t,
+            None => {
+                let FandangoNode::Program(program) = node.root() else {
+                    return Err(anyhow!("root node was not a program node"));
+                };
+                self.seen
+                    .insert(AltPaths::new::<<N as Node>::Type<'_>>(k, program))
+            }
+        };
+
+        // Score against the table as it stands, then fold this individual in so the next
+        // evaluation sees these paths as already-covered.
+        let novel = AltPathVisit::new(table, CountNovel { novel: 0 })
+            .visit(node, 0)
+            .expect("alt-path visit never errors")
+            .continue_value()
+            .expect("alt-path visit never breaks")
+            .value();
+        let _ = AltPathUpdate::inserting(table)
+            .visit(node, 0)
+            .expect("alt-path update never errors")
+            .continue_value()
+            .expect("alt-path update never breaks");
+        Ok(novel)
     }
 }
 
@@ -82,6 +168,22 @@ where
             .parse::<T>()
             .map_err(|e| anyhow!("could not parse {name} from {s:?}: {e}\n{USAGE}")),
     }
+}
+
+/// Recompute both NSGA-II objectives for one individual: `(node count, scope violations)`.
+/// Recomputed from the tree rather than decoded out of the combined measurement, so the
+/// plot shows the raw objective values.
+fn objectives(program: &nonterminal_start) -> (usize, usize) {
+    let nodes = program.count_nodes();
+    let violations = YulConstraintVisitor::default()
+        .visit(program, 0)
+        .expect("scope checker never errors")
+        .continue_value()
+        .expect("scope checker never breaks")
+        .violations()
+        .violations()
+        .len();
+    (nodes, violations)
 }
 
 /// Render a generated Yul tree to its source text.
@@ -236,17 +338,22 @@ fn main() -> Result<(), Error> {
     // stays diverse: scope VALIDITY (violations) and SIZE (node count). Deliberately no
     // fix hook — repairing scope would pin validity at a constant and collapse the
     // fronts, so evolution has to find validity itself (as xml_multiobjective does).
-    const TARGET_NODES: usize = 30;
+    const TARGET_NODES: usize = 300;
     const POP: usize = 100;
     const REPLICATION: usize = 120;
     const WARMUP: usize = 12;
 
     let mut runtime = Nsga2Evolver::new::<nonterminal_start>(
+        // Three objectives: scope VALIDITY, SIZE, and alt-path NOVELTY. The first two
+        // stop competing once validity is solved (~gen 4), which is what let the
+        // population collapse onto clones; novelty keeps rewarding individuals that reach
+        // unexplored grammar structure, so selection has a reason to preserve variety.
         tuple_list!(
             ViolationFitness::<YulConstraintVisitor>::new(),
-            NodeGoal { n: TARGET_NODES }
+            NodeGoal { n: TARGET_NODES },
+            AltPathNovelty::new(k)
         ),
-        KPathDiversityHook::new((), k),
+        AltPathDiversityHook::new((), k),
         POP,
         REPLICATION,
         Ratio::new(80, 100),
@@ -263,11 +370,54 @@ fn main() -> Result<(), Error> {
     println!("grammar = grammars/yul.fan   k = {k}   total {k}-paths in grammar = {total}");
 
     // Warm up: evolve toward the target size before harvesting samples.
+    // Log every individual's objective pair each generation, so the run can be plotted in
+    // objective space afterwards: (generation, nodes, violations).
+    let mut evo_log: Vec<(usize, usize, usize)> = Vec::new();
     let mut population = runtime.initial(&mut generators, &mut sampler)?;
-    for _ in 0..WARMUP {
+    for ind in &population {
+        let (nodes, violations) = objectives(ind.node());
+        evo_log.push((0, nodes, violations));
+    }
+    for generation in 1..=WARMUP {
         population = runtime.step(&mut generators, &mut sampler, population)?;
+        for ind in &population {
+            let (nodes, violations) = objectives(ind.node());
+            evo_log.push((generation, nodes, violations));
+        }
+    }
+    let mut generation = WARMUP;
+
+    // k-alt-path: paths between alternation branch-edges, where k counts alternations
+    // traversed rather than nodes. Covers (k+1)-path with far fewer subdomains.
+    let mut altpaths = AltPaths::new::<TypeMut<'static>>(k, nonterminal_start::ROOT.inner());
+    let (_, alt_total) = altpaths.alt_paths();
+    // The honest comparison is against (k+1)-path: that is what k-alt-path covers, so the
+    // ratio shows how much less we must store for the same covering power.
+    let kplus1 = NonZeroUsize::new(k.get() + 1).expect("k + 1 is non-zero");
+    let (_, kplus1_total) =
+        KPaths::new::<TypeMut<'static>>(kplus1, nonterminal_start::ROOT.inner()).k_paths();
+    println!(
+        "                                  total {k}-alt-paths = {alt_total} · \
+         {kplus1}-paths = {kplus1_total} (k-alt-path covers {kplus1}-path)"
+    );
+    // k-alt-path provably covers (k+1)-path, but empirically covers much longer paths
+    // (the paper's j ~ 3k+1), which is where the 5-10x storage reduction comes from.
+    // Print the path_j curve so the real ratio is visible rather than assumed.
+    {
+        let mut line = alloc_string_for_curve();
+        for j in 1..=6usize {
+            let jj = NonZeroUsize::new(j).expect("j is non-zero");
+            let (_, jt) =
+                KPaths::new::<TypeMut<'static>>(jj, nonterminal_start::ROOT.inner()).k_paths();
+            line.push_str(&format!(
+                "  {j}-path={jt} ({:.1}x)",
+                jt as f64 / alt_total.max(1) as f64
+            ));
+        }
+        println!("                                  vs{line}");
     }
 
+    let mut alt_updater = AltPathUpdate::inserting(&mut altpaths);
     let mut updater = KPathUpdate::inserting(&mut kpaths);
     let mut total_len = 0usize;
     let report_every = 1;
@@ -362,6 +512,11 @@ fn main() -> Result<(), Error> {
             .expect("k-path update never errors")
             .continue_value()
             .expect("k-path update never breaks");
+        alt_updater = alt_updater
+            .visit(program, 0)
+            .expect("k-alt-path update never errors")
+            .continue_value()
+            .expect("k-alt-path update never breaks");
 
         if i % report_every == 0 || i == samples {
             let (uncovered, total) = updater.kpaths().k_paths();
@@ -389,11 +544,41 @@ fn main() -> Result<(), Error> {
         }
       }
       population = runtime.step(&mut generators, &mut sampler, population)?;
+      generation += 1;
+      for ind in &population {
+          let (nodes, violations) = objectives(ind.node());
+          evo_log.push((generation, nodes, violations));
+      }
     }
 
+    // Dump the objective-space trace for plotting.
+    {
+        use std::io::Write as _;
+        let path = std::path::Path::new("nsga2_population.csv");
+        let mut file = std::fs::File::create(path)?;
+        writeln!(file, "generation,nodes,violations")?;
+        for (g, n, v) in &evo_log {
+            writeln!(file, "{g},{n},{v}")?;
+        }
+        println!(
+            "NSGA-II objective log: {} rows over {} generations -> {}",
+            evo_log.len(),
+            generation + 1,
+            path.display()
+        );
+    }
+
+    let (alt_uncovered, alt_total) = alt_updater.altpaths().alt_paths();
+    let alt_covered = alt_total - alt_uncovered;
     let (uncovered, total) = updater.kpaths().k_paths();
     let covered = total - uncovered;
     println!();
+    println!(
+        "Covered {alt_covered} of {alt_total} {k}-alt-paths ({:.2}%)  \
+         [{:.1}x fewer subdomains than {kplus1}-path, which it covers]",
+        percent(alt_covered, alt_total),
+        kplus1_total as f64 / alt_total.max(1) as f64
+    );
     println!(
         "Covered {covered} of {total} {k}-paths ({:.2}%) from {samples} programs \
          ({total_len} chars of Yul total).",
@@ -436,6 +621,10 @@ fn main() -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+fn alloc_string_for_curve() -> String {
+    String::new()
 }
 
 fn percent(part: usize, whole: usize) -> f64 {
