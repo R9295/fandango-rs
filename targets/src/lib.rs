@@ -39,6 +39,9 @@ macro_rules! maybe_deref_mut {
     };
 }
 
+/// The Alpenglow vote-scenario target.
+#[cfg(feature = "alpenglow")]
+pub mod alpenglow;
 /// The module for c language testing.
 #[cfg(feature = "clang")]
 pub mod clang;

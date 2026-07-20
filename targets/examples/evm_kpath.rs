@@ -36,8 +36,14 @@ fn to_bytes(program: &nonterminal_start) -> Result<Vec<u8>, Error> {
 
 fn main() -> Result<(), Error> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let k: usize = args.first().map_or(Ok(2), |a| a.parse()).context("K must be a positive integer")?;
-    let samples: usize = args.get(1).map_or(Ok(2000), |a| a.parse()).context("SAMPLES must be an integer")?;
+    let k: usize = args
+        .first()
+        .map_or(Ok(2), |a| a.parse())
+        .context("K must be a positive integer")?;
+    let samples: usize = args
+        .get(1)
+        .map_or(Ok(2000), |a| a.parse())
+        .context("SAMPLES must be an integer")?;
     let k = NonZeroUsize::new(k).context("K must be > 0")?;
 
     let mut sampler = match args.get(2) {

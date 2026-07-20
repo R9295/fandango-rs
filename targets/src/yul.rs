@@ -78,7 +78,10 @@ mod defs {
 
         /// Pick any in-scope declared name (innermost frame first).
         fn pick_in_scope(&self) -> Option<nonterminal_identifier> {
-            self.scopes.iter().rev().find_map(|frame| frame.last().cloned())
+            self.scopes
+                .iter()
+                .rev()
+                .find_map(|frame| frame.last().cloned())
         }
     }
 
@@ -118,7 +121,8 @@ mod defs {
                 // Register the declared name, renaming it if it shadows/redeclares.
                 let name = decl.nth::<0>().clone();
                 let registered = if self.in_scope(&name) {
-                    let mut fresh = nonterminal_identifier::generate(self.sampler, self.generator, 0);
+                    let mut fresh =
+                        nonterminal_identifier::generate(self.sampler, self.generator, 0);
                     while self.in_scope(&fresh) {
                         fresh = nonterminal_identifier::generate(self.sampler, self.generator, 0);
                     }

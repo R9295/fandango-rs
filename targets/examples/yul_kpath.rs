@@ -28,11 +28,10 @@ use anyhow::{Context, Error, anyhow};
 use fandango::lang::FandangoNode;
 use fandango::tuple_list::tuple_list;
 use fandango::typing::{AsNode, Node, NodeLookup, Structured};
-use fandango::visitor::{VisitableChildren, Visitor};
 use fandango::visitor::navigation::CountNodes;
 use fandango::visitor::write::WriteVisitor;
+use fandango::visitor::{VisitableChildren, Visitor};
 use fandango_core::visitor::altpath::{AltPathUpdate, AltPathVisit, AltPathVisitor, AltPaths};
-use mappable_rc::Mrc;
 use fandango_core::visitor::kpath::{KPathUpdate, KPaths};
 use fandango_runtime::evolvers::Evolver;
 use fandango_runtime::evolvers::multi::{AltPathDiversityHook, Nsga2Evolver};
@@ -40,6 +39,7 @@ use fandango_runtime::measurement::FitnessMeasurer;
 use fandango_runtime::operators::{Checker, DepthLimiter};
 use fandango_runtime::population::Individual;
 use fandango_targets::yul::{self, TypeMut, YulConstraintVisitor, YulFixHook, nonterminal_start};
+use mappable_rc::Mrc;
 use num_rational::Ratio;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -292,7 +292,12 @@ fn evm_run(bytecode_hex: &str) -> EvmOutcome {
     match text.find("error:") {
         None => EvmOutcome::Success,
         Some(idx) => {
-            let msg = text[idx..].lines().next().unwrap_or("error:").trim().to_string();
+            let msg = text[idx..]
+                .lines()
+                .next()
+                .unwrap_or("error:")
+                .trim()
+                .to_string();
             if msg.to_ascii_lowercase().contains("revert") {
                 EvmOutcome::Reverted
             } else {
@@ -441,116 +446,118 @@ fn main() -> Result<(), Error> {
     // Individuals are already scope-repaired by the fix hook, so no fixer call here.
     let mut i = 0usize;
     'harvest: loop {
-      for ind in &population {
-        i += 1;
-        let program = ind.node();
-        let source = to_source(program)?;
-        if !debug && i <= 2 {
-            println!("--- sample #{i} ({} chars) ---\n{source}", source.len());
-        }
-        total_len += source.len();
-
-        // Stage 1/2: solc + evm oracle. Run once per DISTINCT program — the generator
-        // emits many duplicates (mostly `{ }`) that would otherwise bias the tallies.
-        if solc_on {
-            if seen.insert(source.clone()) {
-                solc_checked += 1;
-                let start = Instant::now();
-                let compiled = solc_compile(&source);
-                solc_time += start.elapsed();
-                match compiled {
-                    Ok(bytecode) => {
-                        solc_valid += 1;
-                        let mut outcome = String::from("not run");
-                        if evm_on && !bytecode.is_empty() {
-                            let estart = Instant::now();
-                            outcome = match evm_run(&bytecode) {
-                                EvmOutcome::Success => {
-                                    evm_success += 1;
-                                    "success".to_string()
-                                }
-                                EvmOutcome::Reverted => {
-                                    evm_reverted += 1;
-                                    "reverted".to_string()
-                                }
-                                EvmOutcome::Errored(msg) => {
-                                    evm_errored += 1;
-                                    format!("error ({msg})")
-                                }
-                            };
-                            evm_time += estart.elapsed();
-                        }
-                        if debug {
-                            println!("[debug] #{i:>5}  yul: {source}");
-                            println!("[debug]         bytecode: 0x{bytecode}   evm: {outcome}");
-                        }
-                        if first_valid.is_none() {
-                            first_valid = Some((source.clone(), bytecode, outcome));
-                        }
-                    }
-                    Err(diagnostic) => {
-                        if debug {
-                            println!("[debug] #{i:>5}  yul: {source}");
-                            println!("[debug]         solc rejected: {diagnostic}");
-                        }
-                        if first_invalid.is_none() {
-                            first_invalid = Some((source.clone(), diagnostic));
-                        }
-                    }
-                }
-            } else {
-                duplicates += 1;
-                if debug {
-                    println!("[debug] #{i:>5}  yul: {source}   (duplicate — oracle skipped)");
-                }
+        for ind in &population {
+            i += 1;
+            let program = ind.node();
+            let source = to_source(program)?;
+            if !debug && i <= 2 {
+                println!("--- sample #{i} ({} chars) ---\n{source}", source.len());
             }
-        } else if debug {
-            println!("[debug] #{i:>5}  yul: {source}   (bytecode unavailable: `solc` not found)");
-        }
+            total_len += source.len();
 
-        // Mark every k-path this tree walks as covered.
-        updater = updater
-            .visit(program, 0)
-            .expect("k-path update never errors")
-            .continue_value()
-            .expect("k-path update never breaks");
-        alt_updater = alt_updater
-            .visit(program, 0)
-            .expect("k-alt-path update never errors")
-            .continue_value()
-            .expect("k-alt-path update never breaks");
+            // Stage 1/2: solc + evm oracle. Run once per DISTINCT program — the generator
+            // emits many duplicates (mostly `{ }`) that would otherwise bias the tallies.
+            if solc_on {
+                if seen.insert(source.clone()) {
+                    solc_checked += 1;
+                    let start = Instant::now();
+                    let compiled = solc_compile(&source);
+                    solc_time += start.elapsed();
+                    match compiled {
+                        Ok(bytecode) => {
+                            solc_valid += 1;
+                            let mut outcome = String::from("not run");
+                            if evm_on && !bytecode.is_empty() {
+                                let estart = Instant::now();
+                                outcome = match evm_run(&bytecode) {
+                                    EvmOutcome::Success => {
+                                        evm_success += 1;
+                                        "success".to_string()
+                                    }
+                                    EvmOutcome::Reverted => {
+                                        evm_reverted += 1;
+                                        "reverted".to_string()
+                                    }
+                                    EvmOutcome::Errored(msg) => {
+                                        evm_errored += 1;
+                                        format!("error ({msg})")
+                                    }
+                                };
+                                evm_time += estart.elapsed();
+                            }
+                            if debug {
+                                println!("[debug] #{i:>5}  yul: {source}");
+                                println!("[debug]         bytecode: 0x{bytecode}   evm: {outcome}");
+                            }
+                            if first_valid.is_none() {
+                                first_valid = Some((source.clone(), bytecode, outcome));
+                            }
+                        }
+                        Err(diagnostic) => {
+                            if debug {
+                                println!("[debug] #{i:>5}  yul: {source}");
+                                println!("[debug]         solc rejected: {diagnostic}");
+                            }
+                            if first_invalid.is_none() {
+                                first_invalid = Some((source.clone(), diagnostic));
+                            }
+                        }
+                    }
+                } else {
+                    duplicates += 1;
+                    if debug {
+                        println!("[debug] #{i:>5}  yul: {source}   (duplicate — oracle skipped)");
+                    }
+                }
+            } else if debug {
+                println!(
+                    "[debug] #{i:>5}  yul: {source}   (bytecode unavailable: `solc` not found)"
+                );
+            }
 
-        if i % report_every == 0 || i == samples {
-            let (uncovered, total) = updater.kpaths().k_paths();
-            let covered = total - uncovered;
-            let oracle_note = if evm_on {
-                format!(
-                    "   solc {solc_valid}/{solc_checked} distinct  evm[ok {evm_success}, rev {evm_reverted}, err {evm_errored}]"
-                )
-            } else if solc_on {
-                format!(
-                    "   solc-valid {solc_valid}/{solc_checked} distinct ({:.1}%)",
-                    percent(solc_valid, solc_checked)
-                )
-            } else {
-                String::new()
-            };
-            println!(
-                "  after {i:>6} samples: covered {covered:>7} / {total}  ({:5.2}%){oracle_note}",
-                percent(covered, total)
-            );
-        }
+            // Mark every k-path this tree walks as covered.
+            updater = updater
+                .visit(program, 0)
+                .expect("k-path update never errors")
+                .continue_value()
+                .expect("k-path update never breaks");
+            alt_updater = alt_updater
+                .visit(program, 0)
+                .expect("k-alt-path update never errors")
+                .continue_value()
+                .expect("k-alt-path update never breaks");
 
-        if i >= samples {
-            break 'harvest;
+            if i % report_every == 0 || i == samples {
+                let (uncovered, total) = updater.kpaths().k_paths();
+                let covered = total - uncovered;
+                let oracle_note = if evm_on {
+                    format!(
+                        "   solc {solc_valid}/{solc_checked} distinct  evm[ok {evm_success}, rev {evm_reverted}, err {evm_errored}]"
+                    )
+                } else if solc_on {
+                    format!(
+                        "   solc-valid {solc_valid}/{solc_checked} distinct ({:.1}%)",
+                        percent(solc_valid, solc_checked)
+                    )
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  after {i:>6} samples: covered {covered:>7} / {total}  ({:5.2}%){oracle_note}",
+                    percent(covered, total)
+                );
+            }
+
+            if i >= samples {
+                break 'harvest;
+            }
         }
-      }
-      population = runtime.step(&mut generators, &mut sampler, population)?;
-      generation += 1;
-      for ind in &population {
-          let (nodes, violations) = objectives(ind.node());
-          evo_log.push((generation, nodes, violations));
-      }
+        population = runtime.step(&mut generators, &mut sampler, population)?;
+        generation += 1;
+        for ind in &population {
+            let (nodes, violations) = objectives(ind.node());
+            evo_log.push((generation, nodes, violations));
+        }
     }
 
     // Dump the objective-space trace for plotting.
