@@ -14,25 +14,29 @@ use fandango::visitor::Visitor;
 use fandango::visitor::write::WriteVisitor;
 use fandango_core::visitor::altpath::{AltPathUpdate, AltPaths};
 use fandango_runtime::operators::DepthLimiter;
-use fandango_targets::alpenglow::{self, TypeMut, nonterminal_start};
+use fandango_targets::alpenglow::{
+    self, Certificate, CertificateConstraintVisitor, TypeMut, nonterminal_start,
+};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::num::NonZeroUsize;
 
-const HELP: &str = "Generate Alpenglow vote scenarios and measure k-alt-path diversity.\n\
-\n\
-Usage: alpenglow_altpath [K] [ITERATIONS] [SEED]\n\
-\n\
-Arguments:\n\
-  K           Maximum alternations per alt-path [default: 2]\n\
-  ITERATIONS  Number of scenarios to generate [default: 1000]\n\
-  SEED        Reproducible u64 RNG seed [default: OS entropy]\n\
-\n\
-Options:\n\
-  -h, --help  Print help\n\
-\n\
-Example:\n\
+const HELP: &str = r"Generate certified Alpenglow vote scenarios and measure k-alt-path diversity.
+
+Usage: alpenglow_altpath [K] [ITERATIONS] [SEED]
+
+Arguments:
+  K           Maximum alternations per alt-path [default: 2]
+  ITERATIONS  Number of certified scenarios to generate [default: 1000]
+  SEED        Reproducible u64 RNG seed [default: OS entropy]
+
+Options:
+  -h, --help  Print help
+
+Example:
   cargo run --release --example alpenglow_altpath --features alpenglow -- 2 1000 42";
+
+const MAX_GENERATION_ATTEMPTS: usize = 10_000;
 
 fn render(scenario: &nonterminal_start) -> Result<String, Error> {
     let bytes = WriteVisitor::new(Vec::new())
@@ -41,6 +45,15 @@ fn render(scenario: &nonterminal_start) -> Result<String, Error> {
         .expect("write visitor never breaks")
         .output();
     Ok(String::from_utf8(bytes)?)
+}
+
+fn certificates(scenario: &nonterminal_start) -> Vec<Certificate> {
+    CertificateConstraintVisitor::default()
+        .visit(scenario, 0)
+        .expect("certificate constraint never errors")
+        .continue_value()
+        .expect("certificate constraint never breaks")
+        .certificates()
 }
 
 fn main() -> Result<(), Error> {
@@ -72,15 +85,35 @@ fn main() -> Result<(), Error> {
     let (_, total) = altpaths.alt_paths();
     let mut updater = AltPathUpdate::inserting(&mut altpaths);
     let report_every = (iterations / 10).max(1);
+    let mut rejected = 0usize;
 
     println!("grammar = grammars/alpenglow.fan   k = {k}   total {k}-alt-paths = {total}");
 
     for iteration in 1..=iterations {
-        let scenario = nonterminal_start::generate(&mut sampler, &mut generators, 0);
+        let (scenario, generated_certificates, attempts) = (1..=MAX_GENERATION_ATTEMPTS)
+            .find_map(|attempt| {
+                let scenario = nonterminal_start::generate(&mut sampler, &mut generators, 0);
+                let generated_certificates = certificates(&scenario);
+                (!generated_certificates.is_empty()).then_some((
+                    scenario,
+                    generated_certificates,
+                    attempt,
+                ))
+            })
+            .context("could not generate a certificate-valid scenario in 10,000 attempts")?;
+        rejected += attempts - 1;
 
         if iteration == 1 {
             println!("--- iteration #1 ---");
             print!("{}", render(&scenario)?);
+            println!("certificates:");
+            for certificate in &generated_certificates {
+                println!(
+                    "  - {} ({}% distinct stake)",
+                    certificate.kind(),
+                    certificate.stake_percent()
+                );
+            }
             println!("--- end iteration #1 ---");
         }
 
@@ -90,7 +123,7 @@ fn main() -> Result<(), Error> {
             .continue_value()
             .expect("k-alt-path update never breaks");
 
-        if iteration % report_every == 0 || iteration == iterations {
+        if iteration == 1 || iteration % report_every == 0 || iteration == iterations {
             let (uncovered, total) = updater.altpaths().alt_paths();
             let covered = total - uncovered;
             println!(
@@ -106,10 +139,14 @@ fn main() -> Result<(), Error> {
         "Covered {covered} of {total} {k}-alt-paths ({:.2}%) across {iterations} iterations.",
         percent(covered, total)
     );
+    println!(
+        "Constraint: all {iterations} scenarios produced a certificate; {rejected} uncertified candidates were rejected."
+    );
 
     Ok(())
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn percent(part: usize, whole: usize) -> f64 {
     if whole == 0 {
         0.0
