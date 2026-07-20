@@ -1,7 +1,7 @@
 <start> ::= <block> ;
 
 <block> ::= "{ " <block_decl> " " <statements> "}" ;
-<block_decl> ::= "let " <var_decl> ;
+<block_decl> ::= "let " <var_decl> " := " <literal> ;
 <statements> ::= <statement> " " <statements> | "" ;
 
 <statement> ::= <variable_declaration>
@@ -12,7 +12,7 @@
     | <void_call>
     | <block> ;
 
-<variable_declaration> ::= "let " <var_decl> ;
+<variable_declaration> ::= "let " <var_decl> " := " <literal> ;
 <assignment> ::= <var_use> " := " <value_expr> ;
 <if_statement> ::= "if " <value_expr> " " <block> ;
 <for_loop> ::= "for " <block> " " <value_expr> " " <block> " " <block> ;

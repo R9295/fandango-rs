@@ -4,9 +4,6 @@
 
 extern crate alloc;
 
-mod alpenglow;
-mod alpenglow_two_rounds;
-
 use fandango::{
     dynamic::{DynamicNode, DynamicSampler},
     generation::Generated,
@@ -22,7 +19,7 @@ use std::{
     fs::File,
     io::{self, Write},
     num::NonZeroUsize,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -46,7 +43,6 @@ struct FuzzArgs {
     seed: u64,
     output: Option<PathBuf>,
     k_path: Option<NonZeroUsize>,
-    coverage_state: Option<PathBuf>,
 }
 
 fn main() {
@@ -177,7 +173,6 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
         seed,
         output,
         k_path,
-        coverage_state,
     }))
 }
 
@@ -201,82 +196,8 @@ fn fuzz_to(args: &FuzzArgs, output: &mut dyn Write) -> Result<()> {
     let mut rng = StdRng::seed_from_u64(args.seed);
     let source = fs::read_to_string(&args.file)?;
 
-    if is_alpenglow_target(&args.file) {
-        if source != alpenglow::GRAMMAR {
-            return Err(cli_error(format!(
-                "{} does not match the Alpenglow grammar compiled into this binary",
-                args.file.display()
-            )));
-        }
-        let mut coverage = args
-            .k_path
-            .map(|k| alpenglow::KPathCoverage::load(k, args.coverage_state.as_deref()))
-            .transpose()?;
-        for _ in 0..args.count {
-            let node = alpenglow::generate_tree(&mut rng);
-            if let Some(coverage) = coverage.as_mut() {
-                coverage.observe(&node);
-            }
-            write_node(&node, output)?;
-        }
-        if let Some(coverage) = coverage {
-            if let Some(state) = args.coverage_state.as_deref() {
-                coverage.save(state)?;
-            }
-            let (covered, total) = coverage.totals();
-            let percentage = if total == 0 {
-                0.0
-            } else {
-                covered as f64 / total as f64 * 100.0
-            };
-            eprintln!(
-                "k-path({}): {covered}/{total} ({percentage:.2}%)",
-                args.k_path.unwrap()
-            );
-        }
-        return Ok(());
-    }
-
-    if is_alpenglow_two_rounds_target(&args.file) {
-        if source != alpenglow_two_rounds::GRAMMAR {
-            return Err(cli_error(format!(
-                "{} does not match the two-round Alpenglow grammar compiled into this binary",
-                args.file.display()
-            )));
-        }
-        let mut coverage = args
-            .k_path
-            .map(|k| alpenglow_two_rounds::KPathCoverage::load(k, args.coverage_state.as_deref()))
-            .transpose()?;
-        for _ in 0..args.count {
-            let node = alpenglow_two_rounds::generate_tree(&mut rng);
-            if let Some(coverage) = coverage.as_mut() {
-                coverage.observe(&node);
-            }
-            write_node(&node, output)?;
-        }
-        if let Some(coverage) = coverage {
-            if let Some(state) = args.coverage_state.as_deref() {
-                coverage.save(state)?;
-            }
-            let (covered, total) = coverage.totals();
-            let percentage = if total == 0 {
-                0.0
-            } else {
-                covered as f64 / total as f64 * 100.0
-            };
-            eprintln!(
-                "k-path({}): {covered}/{total} ({percentage:.2}%)",
-                args.k_path.unwrap()
-            );
-        }
-        return Ok(());
-    }
-
     if args.k_path.is_some() {
-        return Err(cli_error(
-            "k-path reporting is currently available only for static Alpenglow grammars",
-        ));
+        return Err(cli_error("k-path reporting is not available"));
     }
 
     let program = parse_owned_program(source)
@@ -315,16 +236,6 @@ fn parse_owned_program(
     Program::try_from(source)
         .map(|program| Box::leak(Box::new(program)))
         .map_err(|err| err.to_string())
-}
-
-fn is_alpenglow_target(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|name| name == "alpenglow-simpler.fan")
-}
-
-fn is_alpenglow_two_rounds_target(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|name| name == "alpenglow_two_rounds.fan")
 }
 
 fn start_definition(program: &'static Program<'static>) -> Result<FandangoNode<'static, 'static>> {
