@@ -1,5 +1,8 @@
 # fandango-rs
 
+# Note:
+always compile with -Znext-solver RUSTFLAGS.
+
 This commit represents the artifact for the submission.
 Thanks for checking it out!
 We're quite proud of it, and happy that you're working with our code.
