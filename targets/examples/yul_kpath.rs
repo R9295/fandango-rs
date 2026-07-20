@@ -36,10 +36,10 @@ use mappable_rc::Mrc;
 use fandango_core::visitor::kpath::{KPathUpdate, KPaths};
 use fandango_runtime::evolvers::Evolver;
 use fandango_runtime::evolvers::multi::{AltPathDiversityHook, Nsga2Evolver};
-use fandango_runtime::measurement::{FitnessMeasurer, ViolationFitness};
+use fandango_runtime::measurement::FitnessMeasurer;
 use fandango_runtime::operators::{Checker, DepthLimiter};
 use fandango_runtime::population::Individual;
-use fandango_targets::yul::{self, TypeMut, YulConstraintVisitor, nonterminal_start};
+use fandango_targets::yul::{self, TypeMut, YulConstraintVisitor, YulFixHook, nonterminal_start};
 use num_rational::Ratio;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -334,26 +334,28 @@ fn main() -> Result<(), Error> {
     let generator = DepthLimiter::new(yul::STRUCTURE.inner(), 30);
     let mut generators = tuple_list!(generator);
 
-    // Two real objectives, so NSGA-II's Pareto sorting is meaningful and the population
-    // stays diverse: scope VALIDITY (violations) and SIZE (node count). Deliberately no
-    // fix hook — repairing scope would pin validity at a constant and collapse the
-    // fronts, so evolution has to find validity itself (as xml_multiobjective does).
+    // Validity is GUARANTEED, not competed for: YulFixHook repairs scope on every
+    // individual the evolver creates, so it never has to be an objective. That frees the
+    // objective space for the two things that actually trade off — SIZE and alt-path
+    // NOVELTY — and keeps Pareto sorting a strong signal.
+    //
+    // Both earlier configurations failed at one end of this dial: validity + size (2 obj)
+    // gave 100% valid but only 6 distinct programs; adding novelty as a third objective
+    // gave 72 distinct but ~10% valid, because three objectives leave nearly everything
+    // non-dominated and dominance stops filtering out invalid programs.
     const TARGET_NODES: usize = 300;
     const POP: usize = 100;
     const REPLICATION: usize = 120;
     const WARMUP: usize = 12;
 
     let mut runtime = Nsga2Evolver::new::<nonterminal_start>(
-        // Three objectives: scope VALIDITY, SIZE, and alt-path NOVELTY. The first two
-        // stop competing once validity is solved (~gen 4), which is what let the
-        // population collapse onto clones; novelty keeps rewarding individuals that reach
-        // unexplored grammar structure, so selection has a reason to preserve variety.
-        tuple_list!(
-            ViolationFitness::<YulConstraintVisitor>::new(),
-            NodeGoal { n: TARGET_NODES },
-            AltPathNovelty::new(k)
-        ),
-        AltPathDiversityHook::new((), k),
+        // Two objectives that genuinely compete: SIZE (reach the node target) and
+        // alt-path NOVELTY (reach grammar structure nobody has reached yet). Bigger
+        // programs are not automatically more novel, so the front stays a real curve.
+        tuple_list!(NodeGoal { n: TARGET_NODES }, AltPathNovelty::new(k)),
+        // The fix hook runs inside the diversity hook, so every individual is
+        // scope-repaired the moment it is created — mutation and crossover included.
+        AltPathDiversityHook::new(YulFixHook, k),
         POP,
         REPLICATION,
         Ratio::new(80, 100),
