@@ -1,7 +1,8 @@
 //! Generate `fuzz_ag_votor` scenarios.
 //!
-//! Each scenario is a JSON input for firedancer's `fuzz_ag_votor` harness. Scenarios that
-//! violate a constraint of [`ConstraintVisitor`] are rejected and generated again.
+//! Each scenario is a JSON input for firedancer's `fuzz_ag_votor` harness. Each generated
+//! scenario is fixed by [`ConstraintFixer`]; scenarios that still violate a constraint of
+//! [`ConstraintVisitor`] are rejected and generated again.
 //!
 //! Usage:
 //! ```text
@@ -14,14 +15,15 @@ use anyhow::{Context, Error};
 use clap::Parser;
 use fandango::generation::Generated;
 use fandango::tuple_list::tuple_list;
-use fandango::visitor::Visitor;
 use fandango::visitor::write::WriteVisitor;
+use fandango::visitor::{Visitor, VisitorMut};
 use fandango_runtime::operators::DepthLimiter;
-use fandango_targets::alpenglow::{self, ConstraintVisitor, nonterminal_start};
+use fandango_targets::alpenglow::{self, ConstraintFixer, ConstraintVisitor, nonterminal_start};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::fs;
 use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 
 /// Generate fuzz_ag_votor scenarios.
@@ -85,19 +87,21 @@ fn main() -> Result<(), Error> {
         let mut accepted = None;
         let mut closest = usize::MAX;
         for _ in 0..args.max_attempts.get() {
-            let candidate = nonterminal_start::generate(&mut sampler, &mut generators, 0);
-            let missing = check(&candidate).missing_votes().len();
-            if missing == 0 {
+            let mut candidate = nonterminal_start::generate(&mut sampler, &mut generators, 0);
+            let Ok(ControlFlow::Continue(_)) =
+                ConstraintFixer::new(&mut sampler, &mut generators).visit_mut(&mut candidate, 0);
+            let violations = check(&candidate).violation_count();
+            if violations == 0 {
                 accepted = Some(candidate);
                 break;
             }
             rejected += 1;
-            closest = closest.min(missing);
+            closest = closest.min(violations);
         }
         let scenario = accepted.with_context(|| {
             format!(
-                "could not generate scenario #{iteration} in {} attempts: every candidate left \
-                 some node without a vote in some slot (the closest missed {closest} node-slot votes)",
+                "could not generate scenario #{iteration} in {} attempts: every candidate violated \
+                 a constraint (the closest {closest} times)",
                 args.max_attempts
             )
         })?;
