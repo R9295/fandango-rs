@@ -20,6 +20,7 @@ clang = []
 static_defs = []
 
 [dev-dependencies]
+clap.workspace = true
 num-rational.workspace = true
 rand = { workspace = true, features = ["default"] }
 

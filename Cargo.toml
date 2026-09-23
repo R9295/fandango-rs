@@ -67,6 +67,7 @@ authors = ["The fandango-rs developers"]
 
 [workspace.dependencies]
 anyhow = { version = "1.0", default-features = false }
+clap = { version = "4.5", features = ["derive"] }
 criterion = { version = "0.7.0", features = ["html_reports"] }
 either = { version = "1.13", default-features = false }
 embedded-io = { version = "0.6.1", features = ["alloc"] }
