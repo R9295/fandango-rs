@@ -1,13 +1,13 @@
-//! Generate `fuzz_ag_votor` scenarios.
+//! Generate Alpenglow block tree scenarios and draw them.
 //!
-//! Each scenario is a JSON input for firedancer's `fuzz_ag_votor` harness, generated and
-//! then fixed by [`alpenglow::fix`].
+//! Each scenario is a JSON block tree, generated and then fixed by [`alpenglow::fix`], which
+//! returns the tree drawn after it.
 //!
 //! Usage:
 //! ```text
-//! cargo run --release --example alpenglow_altpath --features alpenglow -- [-n ITERATIONS] [-s SEED] [-o OUT_DIR]
+//! cargo run --release --example alpenglow_altpath --features alpenglow -- [-n ITERATIONS] [-s SEED] [-o OUT_DIR] [-q]
 //! ```
-//! Defaults: 1000 iterations, a seed from OS entropy, no output directory.
+//! Defaults: 1000 iterations, a seed from OS entropy, no output directory, every tree drawn.
 
 use anyhow::{Context, Error};
 use clap::Parser;
@@ -23,7 +23,7 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-/// Generate fuzz_ag_votor scenarios.
+/// Generate Alpenglow block tree scenarios and draw them.
 #[derive(Parser)]
 #[command(
     after_help = "Example:\n  cargo run --release --example alpenglow_altpath --features alpenglow -- -n 1000 -s 42 -o corpus"
@@ -40,6 +40,10 @@ struct Args {
     /// Directory to write each scenario to as <ITERATION>.json
     #[arg(short, long)]
     out_dir: Option<PathBuf>,
+
+    /// Do not draw the trees
+    #[arg(short, long)]
+    quiet: bool,
 }
 
 fn render(scenario: &nonterminal_start) -> Result<String, Error> {
@@ -69,8 +73,12 @@ fn main() -> Result<(), Error> {
 
     for iteration in 1..=iterations {
         let mut scenario = nonterminal_start::generate(&mut sampler, &mut generators, 0);
-        alpenglow::fix(&mut scenario, &mut sampler, &mut generators);
+        let tree = alpenglow::fix(&mut scenario, &mut sampler, &mut generators);
         let json = render(&scenario)?;
+
+        if !args.quiet {
+            println!("scenario {iteration:06}\n{tree}");
+        }
 
         if let Some(dir) = &args.out_dir {
             let path = dir.join(format!("{iteration:06}.json"));
