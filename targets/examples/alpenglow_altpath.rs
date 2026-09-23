@@ -1,10 +1,13 @@
-//! Generate Alpenglow vote scenarios and measure grammar k-alt-path diversity.
+//! Generate `fuzz_ag_votor` scenarios and measure grammar k-alt-path diversity.
+//!
+//! Each scenario is a JSON input for firedancer's `fuzz_ag_votor` harness. The grammar
+//! carries no constraints, so every generated scenario is kept.
 //!
 //! Usage:
 //! ```text
-//! cargo run --release --example alpenglow_altpath --features alpenglow -- [K] [ITERATIONS] [SEED]
+//! cargo run --release --example alpenglow_altpath --features alpenglow -- [K] [ITERATIONS] [SEED] [OUT_DIR]
 //! ```
-//! Defaults: `K = 2`, `ITERATIONS = 1000`, `SEED` = OS entropy.
+//! Defaults: `K = 2`, `ITERATIONS = 1000`, `SEED` = OS entropy, no `OUT_DIR`.
 
 use anyhow::{Context, Error};
 use fandango::generation::Generated;
@@ -14,29 +17,28 @@ use fandango::visitor::Visitor;
 use fandango::visitor::write::WriteVisitor;
 use fandango_core::visitor::altpath::{AltPathUpdate, AltPaths};
 use fandango_runtime::operators::DepthLimiter;
-use fandango_targets::alpenglow::{
-    self, Certificate, CertificateConstraintVisitor, TypeMut, nonterminal_start,
-};
+use fandango_targets::alpenglow::{self, TypeMut, nonterminal_start};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use std::fs;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 
-const HELP: &str = r"Generate certified Alpenglow vote scenarios and measure k-alt-path diversity.
+const HELP: &str = r"Generate fuzz_ag_votor scenarios and measure k-alt-path diversity.
 
-Usage: alpenglow_altpath [K] [ITERATIONS] [SEED]
+Usage: alpenglow_altpath [K] [ITERATIONS] [SEED] [OUT_DIR]
 
 Arguments:
   K           Maximum alternations per alt-path [default: 2]
-  ITERATIONS  Number of certified scenarios to generate [default: 1000]
+  ITERATIONS  Number of scenarios to generate [default: 1000]
   SEED        Reproducible u64 RNG seed [default: OS entropy]
+  OUT_DIR     Directory to write each scenario to as <ITERATION>.json [default: none]
 
 Options:
   -h, --help  Print help
 
 Example:
-  cargo run --release --example alpenglow_altpath --features alpenglow -- 2 1000 42";
-
-const MAX_GENERATION_ATTEMPTS: usize = 10_000;
+  cargo run --release --example alpenglow_altpath --features alpenglow -- 2 1000 42 corpus";
 
 fn render(scenario: &nonterminal_start) -> Result<String, Error> {
     let bytes = WriteVisitor::new(Vec::new())
@@ -45,15 +47,6 @@ fn render(scenario: &nonterminal_start) -> Result<String, Error> {
         .expect("write visitor never breaks")
         .output();
     Ok(String::from_utf8(bytes)?)
-}
-
-fn certificates(scenario: &nonterminal_start) -> Vec<Certificate> {
-    CertificateConstraintVisitor::default()
-        .visit(scenario, 0)
-        .expect("certificate constraint never errors")
-        .continue_value()
-        .expect("certificate constraint never breaks")
-        .certificates()
 }
 
 fn main() -> Result<(), Error> {
@@ -79,42 +72,33 @@ fn main() -> Result<(), Error> {
         None => StdRng::from_os_rng(),
     };
 
+    let out_dir = args.get(3).map(PathBuf::from);
+    if let Some(dir) = &out_dir {
+        fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    }
+
     let generator = DepthLimiter::new(alpenglow::STRUCTURE.inner(), 40);
     let mut generators = tuple_list!(generator);
     let mut altpaths = AltPaths::new::<TypeMut<'static>>(k, nonterminal_start::ROOT.inner());
     let (_, total) = altpaths.alt_paths();
     let mut updater = AltPathUpdate::inserting(&mut altpaths);
     let report_every = (iterations / 10).max(1);
-    let mut rejected = 0usize;
 
     println!("grammar = grammars/alpenglow.fan   k = {k}   total {k}-alt-paths = {total}");
 
     for iteration in 1..=iterations {
-        let (scenario, generated_certificates, attempts) = (1..=MAX_GENERATION_ATTEMPTS)
-            .find_map(|attempt| {
-                let scenario = nonterminal_start::generate(&mut sampler, &mut generators, 0);
-                let generated_certificates = certificates(&scenario);
-                (!generated_certificates.is_empty()).then_some((
-                    scenario,
-                    generated_certificates,
-                    attempt,
-                ))
-            })
-            .context("could not generate a certificate-valid scenario in 10,000 attempts")?;
-        rejected += attempts - 1;
+        let scenario = nonterminal_start::generate(&mut sampler, &mut generators, 0);
+        let json = render(&scenario)?;
 
         if iteration == 1 {
             println!("--- iteration #1 ---");
-            print!("{}", render(&scenario)?);
-            println!("certificates:");
-            for certificate in &generated_certificates {
-                println!(
-                    "  - {} ({}% distinct stake)",
-                    certificate.kind(),
-                    certificate.stake_percent()
-                );
-            }
+            print!("{json}");
             println!("--- end iteration #1 ---");
+        }
+
+        if let Some(dir) = &out_dir {
+            let path = dir.join(format!("{iteration:06}.json"));
+            fs::write(&path, &json).with_context(|| format!("could not write {}", path.display()))?;
         }
 
         updater = updater
@@ -139,9 +123,9 @@ fn main() -> Result<(), Error> {
         "Covered {covered} of {total} {k}-alt-paths ({:.2}%) across {iterations} iterations.",
         percent(covered, total)
     );
-    println!(
-        "Constraint: all {iterations} scenarios produced a certificate; {rejected} uncertified candidates were rejected."
-    );
+    if let Some(dir) = &out_dir {
+        println!("Wrote {iterations} scenarios to {}.", dir.display());
+    }
 
     Ok(())
 }

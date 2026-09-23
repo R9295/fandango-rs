@@ -1,49 +1,74 @@
 <start> ::= <scenario> ;
 
-<scenario> ::= "alpenglow {\n"
-    "  slot: s0\n"
-    "  blocks: [b1, b2]\n"
-    "  validators: 20\n"
-    "  stake-per-validator: 5%\n"
-    "  byzantine-stake: 20%\n"
-    "  potentially-absent-stake: 20%\n"
-    <byzantine_validators>
-    <potentially_absent_validators>
-    <honest_validators>
-    "}\n" ;
+<scenario> ::= '{"blocks": [' <blocks> '], "nodes": [' <nodes> '], "actions": [' <actions> ']}\n' ;
 
-<byzantine_validators> ::= <byzantine_v0> <byzantine_v1> <byzantine_v2> <byzantine_v3> ;
-<byzantine_v0> ::= "  v0 { stake: 5%, role: byzantine, votes: [" <vote_list> "] }\n" ;
-<byzantine_v1> ::= "  v1 { stake: 5%, role: byzantine, votes: [" <vote_list> "] }\n" ;
-<byzantine_v2> ::= "  v2 { stake: 5%, role: byzantine, votes: [" <vote_list> "] }\n" ;
-<byzantine_v3> ::= "  v3 { stake: 5%, role: byzantine, votes: [" <vote_list> "] }\n" ;
+<blocks> ::= '{"slot_id": 0, "block_id": "0"}, '
+    '{"slot_id": 1, "block_id": "1a", "parent_id": "0"}, {"slot_id": 1, "block_id": "1b", "parent_id": "0"}, '
+    '{"slot_id": 2, "block_id": "2a", "parent_id": "1a"}, {"slot_id": 2, "block_id": "2b", "parent_id": "1b"}, '
+    '{"slot_id": 3, "block_id": "3a", "parent_id": "2a"}, {"slot_id": 3, "block_id": "3b", "parent_id": "2b"}, '
+    '{"slot_id": 4, "block_id": "4a", "parent_id": "3a"}, {"slot_id": 4, "block_id": "4b", "parent_id": "3b"}, '
+    '{"slot_id": 5, "block_id": "5a", "parent_id": "4a"}, {"slot_id": 5, "block_id": "5b", "parent_id": "4b"}, '
+    '{"slot_id": 6, "block_id": "6a", "parent_id": "5a"}, {"slot_id": 6, "block_id": "6b", "parent_id": "5b"}, '
+    '{"slot_id": 7, "block_id": "7a", "parent_id": "6a"}, {"slot_id": 7, "block_id": "7b", "parent_id": "6b"}, '
+    '{"slot_id": 8, "block_id": "8a", "parent_id": "7a"}, {"slot_id": 8, "block_id": "8b", "parent_id": "7b"}, '
+    '{"slot_id": 9, "block_id": "9a", "parent_id": "8a"}, {"slot_id": 9, "block_id": "9b", "parent_id": "8b"}, '
+    '{"slot_id": 10, "block_id": "10a", "parent_id": "9a"}, {"slot_id": 10, "block_id": "10b", "parent_id": "9b"}, '
+    '{"slot_id": 11, "block_id": "11a", "parent_id": "10a"}, {"slot_id": 11, "block_id": "11b", "parent_id": "10b"}, '
+    '{"slot_id": 12, "block_id": "12a", "parent_id": "11a"}, {"slot_id": 12, "block_id": "12b", "parent_id": "11b"}, '
+    '{"slot_id": 13, "block_id": "13a", "parent_id": "12a"}, {"slot_id": 13, "block_id": "13b", "parent_id": "12b"}, '
+    '{"slot_id": 14, "block_id": "14a", "parent_id": "13a"}, {"slot_id": 14, "block_id": "14b", "parent_id": "13b"}, '
+    '{"slot_id": 15, "block_id": "15a", "parent_id": "14a"}, {"slot_id": 15, "block_id": "15b", "parent_id": "14b"}' ;
 
-<potentially_absent_validators> ::= <potentially_absent_v4> <potentially_absent_v5> <potentially_absent_v6> <potentially_absent_v7> ;
-<potentially_absent_v4> ::= "  v4 { stake: 5%, role: potentially-absent, votes: [" <optional_vote_list> "] }\n" ;
-<potentially_absent_v5> ::= "  v5 { stake: 5%, role: potentially-absent, votes: [" <optional_vote_list> "] }\n" ;
-<potentially_absent_v6> ::= "  v6 { stake: 5%, role: potentially-absent, votes: [" <optional_vote_list> "] }\n" ;
-<potentially_absent_v7> ::= "  v7 { stake: 5%, role: potentially-absent, votes: [" <optional_vote_list> "] }\n" ;
+<nodes> ::= <honest_nodes> ', ' <maybe_absent_nodes> ', ' <maybe_byzantine_nodes> ;
+<honest_nodes> ::= '{"node_id": 0, "stake": 620000}, '
+    '{"node_id": 1, "stake": 620000}, '
+    '{"node_id": 2, "stake": 620000}, '
+    '{"node_id": 3, "stake": 620000}, '
+    '{"node_id": 4, "stake": 620000}, '
+    '{"node_id": 5, "stake": 620000}, '
+    '{"node_id": 6, "stake": 620000}, '
+    '{"node_id": 7, "stake": 620000}, '
+    '{"node_id": 8, "stake": 620000}, '
+    '{"node_id": 9, "stake": 620000}' ;
+<maybe_absent_nodes> ::= '{"node_id": 10, "stake": 380000}, '
+    '{"node_id": 11, "stake": 380000}, '
+    '{"node_id": 12, "stake": 380000}, '
+    '{"node_id": 13, "stake": 380000}, '
+    '{"node_id": 14, "stake": 380000}' ;
+<maybe_byzantine_nodes> ::= '{"node_id": 15, "stake": 380000}, '
+    '{"node_id": 16, "stake": 380000}, '
+    '{"node_id": 17, "stake": 380000}, '
+    '{"node_id": 18, "stake": 380000}, '
+    '{"node_id": 19, "stake": 380000}' ;
 
-<honest_validators> ::= <honest_v8> <honest_v9> <honest_v10> <honest_v11> <honest_v12> <honest_v13> <honest_v14> <honest_v15> <honest_v16> <honest_v17> <honest_v18> <honest_v19> ;
-<honest_v8> ::= "  v8 { stake: 5%, role: honest, votes: [" <vote_list> "] }\n" ;
-<honest_v9> ::= "  v9 { stake: 5%, role: honest, votes: [" <vote_list> "] }\n" ;
-<honest_v10> ::= "  v10 { stake: 5%, role: honest, votes: [" <vote_list> "] }\n" ;
-<honest_v11> ::= "  v11 { stake: 5%, role: honest, votes: [" <vote_list> "] }\n" ;
-<honest_v12> ::= "  v12 { stake: 5%, role: honest, votes: [" <vote_list> "] }\n" ;
-<honest_v13> ::= "  v13 { stake: 5%, role: honest, votes: [" <vote_list> "] }\n" ;
-<honest_v14> ::= "  v14 { stake: 5%, role: honest, votes: [" <vote_list> "] }\n" ;
-<honest_v15> ::= "  v15 { stake: 5%, role: honest, votes: [" <vote_list> "] }\n" ;
-<honest_v16> ::= "  v16 { stake: 5%, role: honest, votes: [" <vote_list> "] }\n" ;
-<honest_v17> ::= "  v17 { stake: 5%, role: honest, votes: [" <vote_list> "] }\n" ;
-<honest_v18> ::= "  v18 { stake: 5%, role: honest, votes: [" <vote_list> "] }\n" ;
-<honest_v19> ::= "  v19 { stake: 5%, role: honest, votes: [" <vote_list> "] }\n" ;
+<actions> ::= <action> | <action> ', ' <actions> | <action> ', ' <action> ', ' <action> ', ' <actions> ;
+<action> ::= <vote_notar>
+    | <vote_notar_fallback>
+    | <vote_skip>
+    | <vote_skip_fallback>
+    | <vote_finalize>
+    | <vote_absent>
+    | <first_shred>
+    | <replay_block_complete>
+    | <sig_slot_dead>
+    | <timeout> ;
 
-<optional_vote_list> ::= "" | <vote_list> ;
-<vote_list> ::= <vote> | <vote> ", " <vote_list> ;
+<vote_notar> ::= '{"node_id": ' <node_id> ', "block_id": ' <block_id> ', "action": "VOTE_NOTAR"}' ;
+<vote_notar_fallback> ::= '{"node_id": ' <node_id> ', "block_id": ' <block_id> ', "action": "VOTE_NOTAR_FALLBACK"}' ;
+<vote_skip> ::= '{"node_id": ' <node_id> ', "block_id": ' <block_id> ', "action": "VOTE_SKIP"}' ;
+<vote_skip_fallback> ::= '{"node_id": ' <node_id> ', "block_id": ' <block_id> ', "action": "VOTE_SKIP_FALLBACK"}' ;
+<vote_finalize> ::= '{"node_id": ' <node_id> ', "block_id": ' <block_id> ', "action": "VOTE_FINALIZE"}' ;
+<vote_absent> ::= '{"node_id": ' <node_id> ', "block_id": ' <block_id> ', "action": "VOTE_ABSENT"}' ;
+<first_shred> ::= '{"block_id": ' <block_id> ', "action": "FIRST_SHRED"}' ;
+<replay_block_complete> ::= '{"block_id": ' <block_id> ', "action": "REPLAY_BLOCK_COMPLETE"}' ;
+<sig_slot_dead> ::= '{"block_id": ' <block_id> ', "action": "SIG_SLOT_DEAD"}' ;
+<timeout> ::= '{"action": "TIMEOUT"}' ;
 
-<vote> ::= <skip> | <notarize> | <notarize_fallback> | <skip_fallback> ;
-<skip> ::= "skip" ;
-<notarize> ::= "notarize(" <block> ")" ;
-<notarize_fallback> ::= "notarize-fallback(" <block> ")" ;
-<skip_fallback> ::= "skip-fallback" ;
-<block> ::= "b1" | "b2" ;
+<block_id> ::= '"' <block_slot> <fork> '"' ;
+<block_slot> ::= "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12" | "13" | "14" | "15" ;
+<fork> ::= "a" | "b" ;
+
+<node_id> ::= <honest_node_id> | <maybe_absent_node_id> | <maybe_byzantine_node_id> ;
+<honest_node_id> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
+<maybe_absent_node_id> ::= "10" | "11" | "12" | "13" | "14" ;
+<maybe_byzantine_node_id> ::= "15" | "16" | "17" | "18" | "19" ;
