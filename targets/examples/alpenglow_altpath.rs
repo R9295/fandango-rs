@@ -1,29 +1,26 @@
 //! Generate `fuzz_ag_votor` scenarios.
 //!
-//! Each scenario is a JSON input for firedancer's `fuzz_ag_votor` harness. Each generated
-//! scenario is fixed by [`ConstraintFixer`]; scenarios that still violate a constraint of
-//! [`ConstraintVisitor`] are rejected and generated again.
+//! Each scenario is a JSON input for firedancer's `fuzz_ag_votor` harness, generated and
+//! then fixed by [`alpenglow::fix`].
 //!
 //! Usage:
 //! ```text
-//! cargo run --release --example alpenglow_altpath --features alpenglow -- [-n ITERATIONS] [-s SEED] [-o OUT_DIR] [--max-attempts ATTEMPTS]
+//! cargo run --release --example alpenglow_altpath --features alpenglow -- [-n ITERATIONS] [-s SEED] [-o OUT_DIR]
 //! ```
-//! Defaults: 1000 iterations, a seed from OS entropy, no output directory, 10,000
-//! attempts per scenario.
+//! Defaults: 1000 iterations, a seed from OS entropy, no output directory.
 
 use anyhow::{Context, Error};
 use clap::Parser;
 use fandango::generation::Generated;
 use fandango::tuple_list::tuple_list;
+use fandango::visitor::Visitor;
 use fandango::visitor::write::WriteVisitor;
-use fandango::visitor::{Visitor, VisitorMut};
 use fandango_runtime::operators::DepthLimiter;
-use fandango_targets::alpenglow::{self, ConstraintFixer, ConstraintVisitor, nonterminal_start};
+use fandango_targets::alpenglow::{self, nonterminal_start};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::fs;
 use std::num::NonZeroUsize;
-use std::ops::ControlFlow;
 use std::path::PathBuf;
 
 /// Generate fuzz_ag_votor scenarios.
@@ -43,18 +40,6 @@ struct Args {
     /// Directory to write each scenario to as <ITERATION>.json
     #[arg(short, long)]
     out_dir: Option<PathBuf>,
-
-    /// Candidates to generate per scenario before giving up
-    #[arg(long, default_value = "10000")]
-    max_attempts: NonZeroUsize,
-}
-
-fn check(scenario: &nonterminal_start) -> ConstraintVisitor {
-    ConstraintVisitor::default()
-        .visit(scenario, 0)
-        .expect("constraint never errors")
-        .continue_value()
-        .expect("constraint never breaks")
 }
 
 fn render(scenario: &nonterminal_start) -> Result<String, Error> {
@@ -82,29 +67,9 @@ fn main() -> Result<(), Error> {
     let generator = DepthLimiter::new(alpenglow::STRUCTURE.inner(), 40);
     let mut generators = tuple_list!(generator);
 
-    let mut rejected = 0usize;
     for iteration in 1..=iterations {
-        let mut accepted = None;
-        let mut closest = usize::MAX;
-        for _ in 0..args.max_attempts.get() {
-            let mut candidate = nonterminal_start::generate(&mut sampler, &mut generators, 0);
-            let Ok(ControlFlow::Continue(_)) =
-                ConstraintFixer::new(&mut sampler, &mut generators).visit_mut(&mut candidate, 0);
-            let violations = check(&candidate).violation_count();
-            if violations == 0 {
-                accepted = Some(candidate);
-                break;
-            }
-            rejected += 1;
-            closest = closest.min(violations);
-        }
-        let scenario = accepted.with_context(|| {
-            format!(
-                "could not generate scenario #{iteration} in {} attempts: every candidate violated \
-                 a constraint (the closest {closest} times)",
-                args.max_attempts
-            )
-        })?;
+        let mut scenario = nonterminal_start::generate(&mut sampler, &mut generators, 0);
+        alpenglow::fix(&mut scenario, &mut sampler, &mut generators);
         let json = render(&scenario)?;
 
         if let Some(dir) = &args.out_dir {
@@ -117,7 +82,6 @@ fn main() -> Result<(), Error> {
         Some(dir) => println!("Wrote {iterations} scenarios to {}.", dir.display()),
         None => println!("Generated {iterations} scenarios."),
     }
-    println!("Rejected {rejected} candidates that violated a constraint.");
 
     Ok(())
 }
