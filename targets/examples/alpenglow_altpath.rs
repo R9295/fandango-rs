@@ -4,6 +4,8 @@
 //! corpus contains a shuffled flat JSON list of actions for its nodes. Each slot on the
 //! canonical path is settled one of five ways, picked uniformly (see [`Settle`]); the tip is
 //! never skipped. One in [`DEAD_ONE_IN`] nodes off the canonical path is found dead by replay.
+//! Between each pair of actions, the clock stands still or advances by one of
+//! [`CLOCK_STEPS_MS`].
 //!
 //! Usage:
 //! ```text
@@ -238,6 +240,24 @@ fn action_entries(
     entries
 }
 
+/// Milliseconds that may pass between two actions: between each pair, the clock stands
+/// still or advances by one of these, each with the same chance.
+const CLOCK_STEPS_MS: [u64; 3] = [100, 250, 500];
+
+/// Put a clock step between each pair of actions for which `step` gives one.
+fn insert_clock_steps(actions: Vec<String>, step: &mut impl FnMut() -> Option<u64>) -> Vec<String> {
+    let mut stepped = Vec::with_capacity(2 * actions.len());
+    for (i, action) in actions.into_iter().enumerate() {
+        if i > 0 {
+            if let Some(ms) = step() {
+                stepped.push(format!("{{\"action\": \"CLOCK\", \"ms\": {ms}}}"));
+            }
+        }
+        stepped.push(action);
+    }
+    stepped
+}
+
 fn render_actions(entries: &[String]) -> String {
     format!("[{}]\n", entries.join(", "))
 }
@@ -257,6 +277,10 @@ fn main() -> Result<(), Error> {
     };
     let mut dead_rng = match args.seed {
         Some(seed) => StdRng::seed_from_u64(seed ^ 0x6465_6164_0000_0000),
+        None => StdRng::from_os_rng(),
+    };
+    let mut clock_rng = match args.seed {
+        Some(seed) => StdRng::seed_from_u64(seed ^ 0x636c_6f63_6b00_0000),
         None => StdRng::from_os_rng(),
     };
     let mut settle_rng = match args.seed {
@@ -287,6 +311,10 @@ fn main() -> Result<(), Error> {
             &mut || dead_rng.random_ratio(1, DEAD_ONE_IN),
         );
         actions.shuffle(&mut shuffle_rng);
+        let actions = insert_clock_steps(actions, &mut || {
+            let pick = clock_rng.random_range(0..=CLOCK_STEPS_MS.len());
+            (pick > 0).then(|| CLOCK_STEPS_MS[pick - 1])
+        });
 
         if !args.quiet {
             let path = tree
@@ -349,6 +377,21 @@ mod tests {
                 alpenglow::fix(&mut scenario, &mut sampler, &mut generators)
             })
             .collect()
+    }
+
+    #[test]
+    fn clock_steps_fall_between_actions() {
+        let actions: Vec<String> = ["a", "b", "c"].iter().map(ToString::to_string).collect();
+        let mut steps = [Some(100), None, Some(500)].into_iter();
+        let stepped = insert_clock_steps(actions, &mut || steps.next().unwrap());
+        assert_eq!(stepped, [
+            "a",
+            "{\"action\": \"CLOCK\", \"ms\": 100}",
+            "b",
+            "c",
+        ]);
+        assert!(insert_clock_steps(Vec::new(), &mut || Some(250)).is_empty());
+        assert_eq!(insert_clock_steps(vec!["a".to_string()], &mut || Some(250)), ["a"]);
     }
 
     #[test]
