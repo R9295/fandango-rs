@@ -44,6 +44,11 @@ path = "examples/alpenglow_altpath.rs"
 required-features = ["alpenglow", "static_defs"]
 
 [[example]]
+name = "alpenglow_seqcov"
+path = "examples/alpenglow_seqcov.rs"
+required-features = ["alpenglow", "static_defs"]
+
+[[example]]
 name = "xml_basic"
 path = "examples/xml_basic.rs"
 required-features = ["xml", "static_defs"]
