@@ -1,7 +1,8 @@
 //! Generate Alpenglow block tree scenarios and draw them.
 //!
 //! Each scenario starts as a JSON block tree. [`alpenglow::fix`] labels it, and the output
-//! corpus contains a shuffled flat JSON list of actions for its nodes.
+//! corpus contains a shuffled flat JSON list of actions for its nodes. One in
+//! [`DEAD_ONE_IN`] nodes off the canonical path is found dead by replay.
 //!
 //! Usage:
 //! ```text
@@ -23,8 +24,8 @@ use fandango::visitor::Visitor;
 use fandango::visitor::write::WriteVisitor;
 use fandango_runtime::operators::DepthLimiter;
 use fandango_targets::alpenglow::{self, Tree, nonterminal_children_0, nonterminal_start};
-use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rand::seq::SliceRandom;
 use std::fs;
 use std::num::NonZeroUsize;
@@ -139,15 +140,30 @@ fn render(scenario: &nonterminal_start) -> Result<String, Error> {
     Ok(String::from_utf8(bytes)?)
 }
 
-/// Flatten the tree into actions in preorder. Every node is replayed, and nodes on the
-/// canonical path also get notar and final certificates. The root has no parent and is
-/// omitted.
-fn action_entries(tree: &Tree) -> Vec<String> {
-    fn append(parent: &Tree, canonical: &[alpenglow::Label], entries: &mut Vec<String>) {
+/// One in this many nodes off the canonical path is found dead by replay.
+const DEAD_ONE_IN: u32 = 4;
+
+/// Flatten the tree into actions in preorder. The root has no parent and is omitted.
+///
+/// Nodes on the canonical path are replayed and get notar and final certificates. A node
+/// off it is found dead by replay when `is_dead` says so, and is replayed otherwise. Replay
+/// drops the descendants of a dead block without reporting them, so they get no actions.
+/// `is_dead` is only asked about nodes off the canonical path: the cluster finalizes the
+/// canonical path, so replay never finds a block on it dead.
+fn action_entries(tree: &Tree, is_dead: &mut impl FnMut() -> bool) -> Vec<String> {
+    fn append(
+        parent: &Tree,
+        canonical: &[alpenglow::Label],
+        is_dead: &mut impl FnMut() -> bool,
+        entries: &mut Vec<String>,
+    ) {
         for child in &parent.children {
             let on_path = canonical.first() == Some(&child.label);
+            let dead = !on_path && is_dead();
             let actions: &[&str] = if on_path {
                 &["NOTARIZE_CERT", "FINALIZE_CERT", "REPLAY_COMPLETE"]
+            } else if dead {
+                &["REPLAY_DEAD"]
             } else {
                 &["REPLAY_COMPLETE"]
             };
@@ -157,12 +173,14 @@ fn action_entries(tree: &Tree) -> Vec<String> {
                     child.label, parent.label
                 ));
             }
-            append(child, if on_path { &canonical[1..] } else { &[] }, entries);
+            if !dead {
+                append(child, if on_path { &canonical[1..] } else { &[] }, is_dead, entries);
+            }
         }
     }
 
     let mut entries = Vec::new();
-    append(tree, &tree.canonical_path(), &mut entries);
+    append(tree, &tree.canonical_path(), is_dead, &mut entries);
     entries
 }
 
@@ -183,6 +201,10 @@ fn main() -> Result<(), Error> {
         Some(seed) => StdRng::seed_from_u64(seed ^ 0x7368_7566_666c_6500),
         None => StdRng::from_os_rng(),
     };
+    let mut dead_rng = match args.seed {
+        Some(seed) => StdRng::seed_from_u64(seed ^ 0x6465_6164_0000_0000),
+        None => StdRng::from_os_rng(),
+    };
     let mut sampler = BoundedSampler {
         rng,
         nodes: 1,
@@ -201,7 +223,7 @@ fn main() -> Result<(), Error> {
             continue;
         }
         emitted += 1;
-        let mut actions = action_entries(&tree);
+        let mut actions = action_entries(&tree, &mut || dead_rng.random_ratio(1, DEAD_ONE_IN));
         actions.shuffle(&mut shuffle_rng);
 
         if !args.quiet {
@@ -251,7 +273,7 @@ mod tests {
             node(1, 0, vec![node(2, 0, vec![])]),
             node(1, 1, vec![node(2, 1, vec![]), node(2, 2, vec![node(3, 0, vec![])])]),
         ]);
-        assert_eq!(render_actions(&action_entries(&tree)), concat!(
+        assert_eq!(render_actions(&action_entries(&tree, &mut || false)), concat!(
             "[{\"node\": \"1a\", \"parent\": \"0\", \"action\": \"REPLAY_COMPLETE\"}, ",
             "{\"node\": \"2a\", \"parent\": \"1a\", \"action\": \"REPLAY_COMPLETE\"}, ",
             "{\"node\": \"1b\", \"parent\": \"0\", \"action\": \"NOTARIZE_CERT\"}, ",
@@ -265,7 +287,62 @@ mod tests {
             "{\"node\": \"3a\", \"parent\": \"2c\", \"action\": \"FINALIZE_CERT\"}, ",
             "{\"node\": \"3a\", \"parent\": \"2c\", \"action\": \"REPLAY_COMPLETE\"}]\n"
         ));
-        assert_eq!(render_actions(&action_entries(&node(0, 0, vec![]))), "[]\n");
+        assert_eq!(render_actions(&action_entries(&node(0, 0, vec![]), &mut || false)), "[]\n");
+    }
+
+    #[test]
+    fn dead_nodes_are_off_the_canonical_path_and_hide_their_descendants() {
+        let node = |depth, index, children| Tree {
+            label: alpenglow::Label { depth, index },
+            children,
+        };
+        let tree = node(0, 0, vec![
+            node(1, 0, vec![node(2, 0, vec![])]),
+            node(1, 1, vec![node(2, 1, vec![]), node(2, 2, vec![node(3, 0, vec![])])]),
+        ]);
+        assert_eq!(render_actions(&action_entries(&tree, &mut || true)), concat!(
+            "[{\"node\": \"1a\", \"parent\": \"0\", \"action\": \"REPLAY_DEAD\"}, ",
+            "{\"node\": \"1b\", \"parent\": \"0\", \"action\": \"NOTARIZE_CERT\"}, ",
+            "{\"node\": \"1b\", \"parent\": \"0\", \"action\": \"FINALIZE_CERT\"}, ",
+            "{\"node\": \"1b\", \"parent\": \"0\", \"action\": \"REPLAY_COMPLETE\"}, ",
+            "{\"node\": \"2b\", \"parent\": \"1b\", \"action\": \"REPLAY_DEAD\"}, ",
+            "{\"node\": \"2c\", \"parent\": \"1b\", \"action\": \"NOTARIZE_CERT\"}, ",
+            "{\"node\": \"2c\", \"parent\": \"1b\", \"action\": \"FINALIZE_CERT\"}, ",
+            "{\"node\": \"2c\", \"parent\": \"1b\", \"action\": \"REPLAY_COMPLETE\"}, ",
+            "{\"node\": \"3a\", \"parent\": \"2c\", \"action\": \"NOTARIZE_CERT\"}, ",
+            "{\"node\": \"3a\", \"parent\": \"2c\", \"action\": \"FINALIZE_CERT\"}, ",
+            "{\"node\": \"3a\", \"parent\": \"2c\", \"action\": \"REPLAY_COMPLETE\"}]\n"
+        ));
+    }
+
+    #[test]
+    fn generated_dead_nodes_are_never_canonical() {
+        let mut sampler = BoundedSampler {
+            rng: StdRng::seed_from_u64(7),
+            nodes: 1,
+            max_nodes: 128,
+        };
+        let mut generators = tuple_list!(DepthLimiter::new(alpenglow::STRUCTURE.inner(), 40));
+        let mut dead_seen = false;
+        for _ in 0..200 {
+            sampler.nodes = 1;
+            let mut scenario = nonterminal_start::generate(&mut sampler, &mut generators, 0);
+            let tree = alpenglow::fix(&mut scenario, &mut sampler, &mut generators);
+            let canonical: Vec<String> = tree.canonical_path().iter().map(ToString::to_string).collect();
+            for entry in action_entries(&tree, &mut || true) {
+                if !entry.contains("REPLAY_DEAD") {
+                    continue;
+                }
+                dead_seen = true;
+                for label in &canonical {
+                    assert!(
+                        !entry.contains(&format!("\"node\": \"{label}\"")),
+                        "canonical node {label} is dead: {entry}"
+                    );
+                }
+            }
+        }
+        assert!(dead_seen);
     }
 
     #[test]
