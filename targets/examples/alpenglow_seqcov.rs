@@ -8,7 +8,9 @@
 //!   to e), replay completing it or finding it dead: 8 slots x 5 x 2 = 80.
 //!
 //! A t-sequence is covered once some scenario has those t events in that order, not
-//! necessarily adjacent.  Its universe is every ordered t-tuple of distinct events that one
+//! necessarily adjacent.  Up to 10 million t-sequences, every one is counted; past that
+//! (t = 4 on), coverage is estimated from random t-sequences of the universe, drawn
+//! uniformly, with a 95% interval, as the corpus holds too many distinct ones to keep.  Its universe is every ordered t-tuple of distinct events that one
 //! scenario could hold: one settle mode per slot, no skip in the last slot (the canonical
 //! tip would lie below it), no replay of a skipped slot, one event per off-chain node, and
 //! at most 4 off-chain nodes in a slot, as the canonical node takes one of its 5 labels.
@@ -18,12 +20,14 @@
 //!
 //! Usage:
 //! ```text
-//! cargo run --release -p fandango-targets --example alpenglow_seqcov --features alpenglow -- CORPUS_DIR [-t MAX_T]
+//! cargo run --release -p fandango-targets --example alpenglow_seqcov --features alpenglow -- CORPUS_DIR [-t MAX_T] [-n SAMPLES] [-s SEED]
 //! ```
 
 use anyhow::{Context, Error, bail};
 use fandango_targets::alpenglow::Tree;
 use clap::Parser;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -37,7 +41,18 @@ struct Args {
     /// Largest sequence length to measure
     #[arg(short, default_value = "3")]
     t: usize,
+
+    /// Random t-sequences to check for each t with too many to count
+    #[arg(short = 'n', long, default_value = "10000")]
+    samples: usize,
+
+    /// Seed for drawing the random t-sequences
+    #[arg(short, long, default_value = "0")]
+    seed: u64,
 }
+
+/// Largest universe counted exactly, rather than sampled.
+const EXACT_MAX: u128 = 10_000_000;
 
 const SLOTS: usize = 8;
 const WIDTH: usize = 5;
@@ -128,6 +143,30 @@ fn universe(t_max: usize) -> Vec<u128> {
     (0..=t_max).map(|t| sets.get(t).copied().unwrap_or(0) * (1..=t as u128).product::<u128>()).collect()
 }
 
+fn name(e: Event) -> String {
+    let label = if e >= CANONICAL { char::from(b'a' + ((e - CANONICAL) / 2 % WIDTH) as u8).to_string() } else { String::new() };
+    format!("{}:{}{label}", CLASSES[class_of(e)], slot_of(e))
+}
+
+/// A uniformly random feasible t-sequence: draw t distinct events until they are feasible.
+fn draw(rng: &mut StdRng, t: usize) -> Vec<Event> {
+    let mut events: Vec<Event> = (0..EVENTS).collect();
+    loop {
+        for i in 0..t {
+            let j = rng.random_range(i..EVENTS);
+            events.swap(i, j);
+        }
+        if feasible(&events[..t]) {
+            return events[..t].to_vec();
+        }
+    }
+}
+
+/// Whether a scenario, by each event's position in it, holds the sequence in order.
+fn in_order(sequence: &[Event], position: &[usize; EVENTS]) -> bool {
+    sequence.windows(2).all(|w| position[w[0]] < position[w[1]]) && position[sequence[sequence.len() - 1]] != usize::MAX
+}
+
 fn parse_node(label: &str) -> Result<(usize, usize), Error> {
     let b = label.as_bytes();
     if b.len() != 2 || !(b'1'..=b'8').contains(&b[0]) || !(b'a'..=b'e').contains(&b[1]) {
@@ -193,11 +232,15 @@ fn subsequences(order: &[Event], t: usize, into: &mut impl FnMut(u64)) {
 
 fn main() -> Result<(), Error> {
     let args = Args::parse();
-    if args.t == 0 || args.t > 9 {
-        bail!("t must be 1 to 9, as a t-sequence packs into a u64");
+    if args.t == 0 || args.t > 18 {
+        bail!("t must be 1 to 18, as 128^t must fit a u128");
     }
     let universe = universe(args.t);
+    let exact: Vec<bool> = universe.iter().map(|&u| u <= EXACT_MAX).collect();
     let mut seen: Vec<HashSet<u64>> = vec![HashSet::new(); args.t + 1];
+    let mut rng = StdRng::seed_from_u64(args.seed);
+    let mut uncovered: Vec<Vec<Vec<Event>>> =
+        (0..=args.t).map(|t| if t == 0 || exact[t] { Vec::new() } else { (0..args.samples).map(|_| draw(&mut rng, t)).collect() }).collect();
     let mut files = 0;
 
     for entry in fs::read_dir(&args.corpus).with_context(|| format!("could not read {}", args.corpus.display()))? {
@@ -207,17 +250,33 @@ fn main() -> Result<(), Error> {
             bail!("{}: events outside the modelled universe", path.display());
         }
         files += 1;
+        let mut position = [usize::MAX; EVENTS];
+        order.iter().enumerate().for_each(|(i, &e)| position[e] = i);
         for t in 1..=args.t {
-            subsequences(&order, t, &mut |key| {
-                seen[t].insert(key);
-            });
+            if exact[t] {
+                subsequences(&order, t, &mut |key| {
+                    seen[t].insert(key);
+                });
+            } else {
+                uncovered[t].retain(|sequence| !in_order(sequence, &position));
+            }
         }
     }
 
     println!("{files} scenarios, k = {EVENTS} events");
     for t in 1..=args.t {
-        let covered = seen[t].len() as u128;
-        println!("t={t}: {covered}/{} sequences ({:.2}%)", universe[t], 100.0 * covered as f64 / universe[t] as f64);
+        if exact[t] {
+            let covered = seen[t].len() as u128;
+            println!("t={t}: {covered}/{} sequences ({:.2}%)", universe[t], 100.0 * covered as f64 / universe[t] as f64);
+        } else {
+            let n = args.samples as f64;
+            let p = (args.samples - uncovered[t].len()) as f64 / n;
+            let margin = 1.96 * (p * (1.0 - p) / n).sqrt();
+            println!("t={t}: {:.2}% +- {:.2}% of {} sequences, from {} samples", 100.0 * p, 100.0 * margin, universe[t], args.samples);
+            for sequence in uncovered[t].iter().take(3) {
+                println!("  missing: {}", sequence.iter().map(|&e| name(e)).collect::<Vec<_>>().join(" "));
+            }
+        }
     }
 
     /* Pairs by event class: which orders of two events the corpus reaches */
@@ -303,6 +362,24 @@ mod tests {
         assert!(!feasible(&[off_chain(1, 4, false)]));
         assert!(!feasible(&[off_chain(1, 0, false), off_chain(1, 1, false), off_chain(1, 2, false), off_chain(1, 3, false)]));
         assert!(!feasible(&[off_chain(SLOTS, 0, true)]));
+    }
+
+    #[test]
+    fn in_order_needs_every_event_in_order() {
+        let mut position = [usize::MAX; EVENTS];
+        position[7] = 0;
+        position[3] = 4;
+        position[9] = 2;
+        assert!(in_order(&[7, 9, 3], &position));
+        assert!(!in_order(&[9, 7, 3], &position));
+        assert!(!in_order(&[7, 9, 3, 1], &position));
+        assert!(!in_order(&[1, 7], &position));
+    }
+
+    #[test]
+    fn draws_are_feasible() {
+        let mut rng = StdRng::seed_from_u64(1);
+        assert!((0..1000).all(|_| feasible(&draw(&mut rng, 5))));
     }
 
     #[test]
