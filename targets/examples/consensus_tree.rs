@@ -21,7 +21,8 @@
 //! does: every certificate and replay result above becomes one action naming its node and
 //! the block that node cites as its parent. Each replay result also comes with a
 //! `REPLAY_ARRIVES` action for its block, which the shuffle keeps ahead of the result: a
-//! block's replay cannot finish before the block arrives.
+//! block's replay cannot finish before the block arrives. Between each pair of actions,
+//! the clock advances by one of [`CLOCK_STEPS_MS`], picked by its weight.
 //!
 //! Usage:
 //! ```text
@@ -91,6 +92,12 @@ const REPLAY_ARRIVES: &str = "REPLAY_ARRIVES";
 const REPLAY_COMPLETE: &str = "REPLAY_COMPLETE";
 /// Replay finds a block invalid.
 const REPLAY_DEAD: &str = "REPLAY_DEAD";
+
+/// Milliseconds the clock advances between two actions, each with its weight out of
+/// [`CLOCK_WEIGHT_TOTAL`]: 50 ms and 100 ms 45% of the time each, 500 ms 10%.
+const CLOCK_STEPS_MS: [(u64, u32); 3] = [(50, 9), (100, 9), (500, 2)];
+/// The sum of the weights in [`CLOCK_STEPS_MS`].
+const CLOCK_WEIGHT_TOTAL: u32 = 20;
 
 /// The certificate that skips a canonical slot.
 const SKIP_CERT: &str = "SKIP_CERT";
@@ -294,6 +301,18 @@ impl<F: FnMut() -> bool> Drawing<'_, F> {
     }
 }
 
+/// Pick a clock step from [`CLOCK_STEPS_MS`] by weight.
+fn clock_step(rng: &mut StdRng) -> u64 {
+    let mut pick = rng.random_range(0..CLOCK_WEIGHT_TOTAL);
+    for (ms, weight) in CLOCK_STEPS_MS {
+        if pick < weight {
+            return ms;
+        }
+        pick -= weight;
+    }
+    unreachable!("the weights sum to CLOCK_WEIGHT_TOTAL")
+}
+
 fn main() -> Result<(), Error> {
     let args = Args::parse();
     let mut rng = match args.seed {
@@ -302,7 +321,7 @@ fn main() -> Result<(), Error> {
     };
     // Keep the generated trees stable for a seed while choosing which slots to skip, which
     // certificates settle each canonical slot, which off-path blocks are dead, and how the
-    // actions are shuffled.
+    // actions are shuffled, and how far the clock steps between them.
     let mut skip_rng = match args.seed {
         Some(seed) => StdRng::seed_from_u64(seed ^ 0x736b_6970_0000_0000),
         None => StdRng::from_os_rng(),
@@ -313,6 +332,10 @@ fn main() -> Result<(), Error> {
     };
     let mut dead_rng = match args.seed {
         Some(seed) => StdRng::seed_from_u64(seed ^ 0x6465_6164_0000_0000),
+        None => StdRng::from_os_rng(),
+    };
+    let mut clock_rng = match args.seed {
+        Some(seed) => StdRng::seed_from_u64(seed ^ 0x636c_6f63_6b00_0000),
         None => StdRng::from_os_rng(),
     };
     let mut shuffle_rng = match args.seed {
@@ -363,7 +386,15 @@ fn main() -> Result<(), Error> {
         let mut actions = drawing.actions;
         actions.shuffle(&mut shuffle_rng);
         arrivals_first(&mut actions);
-        let actions: Vec<String> = actions.iter().map(ToString::to_string).collect();
+        let mut stepped = Vec::with_capacity(2 * actions.len());
+        for (i, action) in actions.iter().enumerate() {
+            if i > 0 {
+                let ms = clock_step(&mut clock_rng);
+                stepped.push(format!("{{\"action\": \"CLOCK\", \"ms\": {ms}}}"));
+            }
+            stepped.push(action.to_string());
+        }
+        let actions = stepped;
         let path = canonical
             .iter()
             .map(|label| if skipped.contains(label) { format!("{label} (skip)") } else { label.to_string() })
