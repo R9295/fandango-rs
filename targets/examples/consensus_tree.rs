@@ -8,6 +8,9 @@
 //! instead: the slot has no canonical block, so the nodes under it cite the block before it
 //! as their parent. Every other node, at any depth, is skipped without saying so.
 //!
+//! Each canonical node also shows the certificates that settle it: a skipped slot gets
+//! `SKIP_CERT`, and a finalized one gets one of [`FINALIZE_WAYS`], picked uniformly.
+//!
 //! Usage:
 //! ```text
 //! RUSTFLAGS="-Znext-solver" cargo run -p fandango-targets --example consensus_tree -- [-n ITERATIONS] [-s SEED] [-d DEPTH]
@@ -19,6 +22,7 @@ use anyhow::{Context, Error};
 use clap::Parser;
 use core::convert::Infallible;
 use core::fmt;
+use core::fmt::Write;
 use fandango::Fandango;
 use fandango::generation::Generated;
 use fandango::tuple_list::tuple_list;
@@ -55,6 +59,21 @@ const MAX_WIDTH: usize = 5;
 
 /// One in this many canonical slots before the tip is skipped.
 const SKIP_ONE_IN: u32 = 4;
+
+/// The certificates that can finalize a canonical slot, as in `alpenglow_altpath`. A notar
+/// fallback certificate finalizes its block only through a finalized descendant.
+const FINALIZE_WAYS: [&str; 4] = [
+    NOTAR_FALLBACK_CERT,
+    "NOTARIZE_CERT + FINALIZE_CERT",
+    "FAST_FINALIZE_CERT",
+    "FAST_FINALIZE_CERT + NOTARIZE_CERT",
+];
+
+/// The certificate that skips a canonical slot.
+const SKIP_CERT: &str = "SKIP_CERT";
+
+/// The certificate that finalizes its block only through a finalized descendant.
+const NOTAR_FALLBACK_CERT: &str = "NOTAR_FALLBACK_CERT";
 
 /// A node's label: `0` for the root, else its depth then its index among the nodes of its
 /// depth, in letters, as in `alpenglow::Label`.
@@ -127,34 +146,42 @@ fn canonical_path(nodes: &[Node]) -> Vec<Label> {
 }
 
 /// Draw `nodes`, the children of `parent`, and theirs, each line starting with `prefix`.
-/// Canonical nodes are marked `finalize`, or `skip` if their slot is skipped; every other
-/// node is skipped, which goes without saying. `cited` is the block the nodes build on:
-/// `parent`, or the block before it if `parent` is a skipped slot. It is drawn when it
-/// differs from `parent`.
-fn draw(
-    out: &mut String,
-    nodes: &[Node],
-    canonical: &[Label],
-    skipped: &[Label],
-    parent: Label,
-    cited: Label,
-    prefix: &mut String,
-) {
+/// Each canonical node, paired with its certificates in `canonical`, is marked `finalize`,
+/// or `skip` if its slot is skipped, followed by the certificates; every other node is
+/// skipped, which goes without saying. A node settled by [`NOTAR_FALLBACK_CERT`] also names
+/// the finalization it waits on: that of the next canonical node settled by any other
+/// certificates but [`SKIP_CERT`], or none. `cited` is the block the nodes build on: `parent`,
+/// or the block before it if `parent` is a skipped slot. It is drawn when it differs from
+/// `parent`.
+fn draw(out: &mut String, nodes: &[Node], canonical: &[(Label, &str)], parent: Label, cited: Label, prefix: &mut String) {
     for (i, node) in nodes.iter().enumerate() {
         let last = i + 1 == nodes.len();
-        let mut mark = match (canonical.contains(&node.label), skipped.contains(&node.label)) {
-            (true, true) => String::from("  skip"),
-            (true, false) => String::from("  finalize"),
-            (false, _) => String::new(),
-        };
-        if cited != parent {
-            mark += &format!("  (parent {cited})");
+        let position = canonical.iter().position(|&(label, _)| label == node.label);
+        let settled = position.map(|i| canonical[i].1);
+        let skipped = settled == Some(SKIP_CERT);
+        let _ = write!(out, "{prefix}{}{}", if last { "└── " } else { "├── " }, node.label);
+        if let Some(certificates) = settled {
+            let _ = write!(out, "  {}  {certificates}", if skipped { "skip" } else { "finalize" });
         }
-        *out += &format!("{prefix}{}{}{mark}\n", if last { "└── " } else { "├── " }, node.label);
+        if let Some(i) = position.filter(|_| settled == Some(NOTAR_FALLBACK_CERT)) {
+            let finalized = canonical[i + 1..]
+                .iter()
+                .find(|&&(_, certificates)| certificates != SKIP_CERT && certificates != NOTAR_FALLBACK_CERT);
+            match finalized {
+                Some((label, _)) => {
+                    let _ = write!(out, "  (waits on finalization of {label})");
+                }
+                None => out.push_str("  (waits on none)"),
+            }
+        }
+        if cited != parent {
+            let _ = write!(out, "  (parent {cited})");
+        }
+        out.push('\n');
         let len = prefix.len();
         prefix.push_str(if last { "    " } else { "│   " });
-        let next = if skipped.contains(&node.label) { cited } else { node.label };
-        draw(out, &node.children, canonical, skipped, node.label, next, prefix);
+        let next = if skipped { cited } else { node.label };
+        draw(out, &node.children, canonical, node.label, next, prefix);
         prefix.truncate(len);
     }
 }
@@ -165,9 +192,14 @@ fn main() -> Result<(), Error> {
         Some(seed) => StdRng::seed_from_u64(seed),
         None => StdRng::from_os_rng(),
     };
-    // Keep the generated trees stable for a seed while choosing which slots to skip.
+    // Keep the generated trees stable for a seed while choosing which slots to skip and
+    // which certificates settle each canonical slot.
     let mut skip_rng = match args.seed {
         Some(seed) => StdRng::seed_from_u64(seed ^ 0x736b_6970_0000_0000),
+        None => StdRng::from_os_rng(),
+    };
+    let mut certificate_rng = match args.seed {
+        Some(seed) => StdRng::seed_from_u64(seed ^ 0x6365_7274_0000_0000),
         None => StdRng::from_os_rng(),
     };
     let mut generators = tuple_list!(DepthLimiter::new(STRUCTURE.inner(), args.depth));
@@ -191,9 +223,20 @@ fn main() -> Result<(), Error> {
         let (_tip, before_tip) = canonical.split_last().expect("a nonempty tree has a path");
         let skipped: Vec<Label> =
             before_tip.iter().copied().filter(|_| skip_rng.random_ratio(1, SKIP_ONE_IN)).collect();
+        let settled: Vec<(Label, &str)> = canonical
+            .iter()
+            .map(|&label| {
+                let certificates = if skipped.contains(&label) {
+                    SKIP_CERT
+                } else {
+                    FINALIZE_WAYS[certificate_rng.random_range(0..FINALIZE_WAYS.len())]
+                };
+                (label, certificates)
+            })
+            .collect();
         let mut tree = String::from("0\n");
         let root = Label { depth: 0, index: 0 };
-        draw(&mut tree, &roots, &canonical, &skipped, root, root, &mut String::new());
+        draw(&mut tree, &roots, &settled, root, root, &mut String::new());
         let path = canonical
             .iter()
             .map(|label| if skipped.contains(label) { format!("{label} (skip)") } else { label.to_string() })
