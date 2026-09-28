@@ -20,7 +20,7 @@
 //!
 //! Usage:
 //! ```text
-//! cargo run --release -p fandango-targets --example alpenglow_seqcov --features alpenglow -- CORPUS_DIR [-t MAX_T] [-n SAMPLES] [-s SEED]
+//! cargo run --release -p fandango-targets --example alpenglow_seqcov --features alpenglow -- CORPUS_DIR [-t MAX_T] [-n SAMPLES] [-s SEED] [-j JOBS]
 //! ```
 
 use anyhow::{Context, Error, bail};
@@ -28,9 +28,11 @@ use fandango_targets::alpenglow::Tree;
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::thread;
 
 /// Measure t-way sequence coverage of an alpenglow_altpath corpus.
 #[derive(Parser)]
@@ -49,6 +51,35 @@ struct Args {
     /// Seed for drawing the random t-sequences
     #[arg(short, long, default_value = "0")]
     seed: u64,
+
+    /// Threads [default: one per CPU]
+    #[arg(short, long)]
+    jobs: Option<usize>,
+}
+
+/// A set of packed t-sequences, one bit each, that threads add to together.
+struct Bitset(Vec<AtomicU64>);
+
+impl Bitset {
+    fn new(bits: usize) -> Self {
+        Self((0..bits.div_ceil(64)).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    fn insert(&self, key: u64) {
+        let (word, bit) = (&self.0[(key / 64) as usize], 1u64 << (key % 64));
+        /* Most keys are already set, and a load leaves the cache line shared */
+        if word.load(Relaxed) & bit == 0 {
+            word.fetch_or(bit, Relaxed);
+        }
+    }
+
+    fn contains(&self, key: u64) -> bool {
+        self.0[(key / 64) as usize].load(Relaxed) & (1u64 << (key % 64)) != 0
+    }
+
+    fn len(&self) -> u128 {
+        self.0.iter().map(|w| u128::from(w.load(Relaxed).count_ones())).sum()
+    }
 }
 
 /// Largest universe counted exactly, rather than sampled.
@@ -237,36 +268,61 @@ fn main() -> Result<(), Error> {
     }
     let universe = universe(args.t);
     let exact: Vec<bool> = universe.iter().map(|&u| u <= EXACT_MAX).collect();
-    let mut seen: Vec<HashSet<u64>> = vec![HashSet::new(); args.t + 1];
+    let seen: Vec<Bitset> = (0..=args.t).map(|t| Bitset::new(if t > 0 && exact[t] { EVENTS.pow(t as u32) } else { 0 })).collect();
     let mut rng = StdRng::seed_from_u64(args.seed);
-    let mut uncovered: Vec<Vec<Vec<Event>>> =
+    let samples: Vec<Vec<Vec<Event>>> =
         (0..=args.t).map(|t| if t == 0 || exact[t] { Vec::new() } else { (0..args.samples).map(|_| draw(&mut rng, t)).collect() }).collect();
-    let mut files = 0;
+    let found: Vec<Vec<AtomicBool>> = samples.iter().map(|s| s.iter().map(|_| AtomicBool::new(false)).collect()).collect();
 
-    for entry in fs::read_dir(&args.corpus).with_context(|| format!("could not read {}", args.corpus.display()))? {
-        let path = entry?.path();
-        let order = events(&fs::read_to_string(&path)?).with_context(|| format!("could not parse {}", path.display()))?;
-        if !feasible(&order) {
-            bail!("{}: events outside the modelled universe", path.display());
-        }
-        files += 1;
-        let mut position = [usize::MAX; EVENTS];
-        order.iter().enumerate().for_each(|(i, &e)| position[e] = i);
-        for t in 1..=args.t {
-            if exact[t] {
-                subsequences(&order, t, &mut |key| {
-                    seen[t].insert(key);
-                });
-            } else {
-                uncovered[t].retain(|sequence| !in_order(sequence, &position));
+    let paths: Vec<PathBuf> = fs::read_dir(&args.corpus)
+        .with_context(|| format!("could not read {}", args.corpus.display()))?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<Result<_, _>>()?;
+    let jobs = args.jobs.unwrap_or_else(|| thread::available_parallelism().map_or(1, |n| n.get()));
+    let next = AtomicUsize::new(0);
+
+    /* Each thread takes the next file until none are left, adding the sequences it finds
+       to the shared bitsets and flags */
+    let scan = || -> Result<(), Error> {
+        let mut unfound: Vec<Vec<usize>> = samples.iter().map(|s| (0..s.len()).collect()).collect();
+        while let Some(path) = paths.get(next.fetch_add(1, Relaxed)) {
+            let order = events(&fs::read_to_string(path)?).with_context(|| format!("could not parse {}", path.display()))?;
+            if !feasible(&order) {
+                bail!("{}: events outside the modelled universe", path.display());
+            }
+            let mut position = [usize::MAX; EVENTS];
+            order.iter().enumerate().for_each(|(i, &e)| position[e] = i);
+            for t in 1..=args.t {
+                if exact[t] {
+                    subsequences(&order, t, &mut |key| seen[t].insert(key));
+                } else {
+                    unfound[t].retain(|&i| {
+                        if found[t][i].load(Relaxed) {
+                            return false;
+                        }
+                        let hit = in_order(&samples[t][i], &position);
+                        if hit {
+                            found[t][i].store(true, Relaxed);
+                        }
+                        !hit
+                    });
+                }
             }
         }
-    }
+        Ok(())
+    };
+    thread::scope(|scope| {
+        let workers: Vec<_> = (0..jobs).map(|_| scope.spawn(&scan)).collect();
+        workers.into_iter().try_for_each(|w| w.join().expect("scan thread panicked"))
+    })?;
+    let files = paths.len();
+    let uncovered: Vec<Vec<&Vec<Event>>> =
+        samples.iter().zip(&found).map(|(s, f)| s.iter().zip(f).filter(|(_, f)| !f.load(Relaxed)).map(|(s, _)| s).collect()).collect();
 
     println!("{files} scenarios, k = {EVENTS} events");
     for t in 1..=args.t {
         if exact[t] {
-            let covered = seen[t].len() as u128;
+            let covered = seen[t].len();
             println!("t={t}: {covered}/{} sequences ({:.2}%)", universe[t], 100.0 * covered as f64 / universe[t] as f64);
         } else {
             let n = args.samples as f64;
@@ -288,7 +344,7 @@ fn main() -> Result<(), Error> {
             for b in 0..EVENTS {
                 if feasible(&[a, b]) {
                     total[class_of(a)][class_of(b)] += 1;
-                    covered[class_of(a)][class_of(b)] += u64::from(seen[2].contains(&((a * EVENTS + b) as u64)));
+                    covered[class_of(a)][class_of(b)] += u64::from(seen[2].contains((a * EVENTS + b) as u64));
                 }
             }
         }
