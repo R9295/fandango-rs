@@ -12,8 +12,16 @@
 //! `SKIP_CERT`, and a finalized one gets one of [`FINALIZE_WAYS`], picked uniformly.
 //!
 //! Every block also shows what replay finds: `replay complete`, or, for one in
-//! [`DEAD_ONE_IN`] blocks off the canonical path, `replay dead`, which leaves its
-//! descendants unreached. A skipped slot has no block to replay.
+//! [`DEAD_ONE_IN`] blocks off the canonical path, `replay dead`. A skipped slot has no
+//! block to replay. An adversarial leader can still build on a dead block, so its
+//! descendants still arrive, and replay finds each of them dead or complete like any other
+//! off-path block. The drawing notes the dead block they are under.
+//!
+//! Each tree is then flattened into a shuffled JSON list of actions, as `alpenglow_altpath`
+//! does: every certificate and replay result above becomes one action naming its node and
+//! the block that node cites as its parent. Each replay result also comes with a
+//! `REPLAY_ARRIVES` action for its block, which the shuffle keeps ahead of the result: a
+//! block's replay cannot finish before the block arrives.
 //!
 //! Usage:
 //! ```text
@@ -33,6 +41,7 @@ use fandango::tuple_list::tuple_list;
 use fandango::visitor::Visitor;
 use fandango::visitor::write::WriteVisitor;
 use fandango_runtime::operators::DepthLimiter;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use serde_json::Value;
@@ -75,6 +84,13 @@ const FINALIZE_WAYS: [&str; 4] = [
 
 /// One in this many off-path blocks is found dead by replay.
 const DEAD_ONE_IN: u32 = 4;
+
+/// A block arrives for replay.
+const REPLAY_ARRIVES: &str = "REPLAY_ARRIVES";
+/// Replay finishes a block.
+const REPLAY_COMPLETE: &str = "REPLAY_COMPLETE";
+/// Replay finds a block invalid.
+const REPLAY_DEAD: &str = "REPLAY_DEAD";
 
 /// The certificate that skips a canonical slot.
 const SKIP_CERT: &str = "SKIP_CERT";
@@ -152,7 +168,44 @@ fn canonical_path(nodes: &[Node]) -> Vec<Label> {
     best
 }
 
-/// Draws a tree, a node per line.
+/// An action on `node`, which cites `parent`.
+#[derive(Clone, Copy)]
+struct Action {
+    node: Label,
+    parent: Label,
+    kind: &'static str,
+}
+
+impl Action {
+    /// Whether this action reports how a block's replay ended.
+    fn is_replay_result(self) -> bool {
+        self.kind == REPLAY_COMPLETE || self.kind == REPLAY_DEAD
+    }
+}
+
+/// The action as `alpenglow_altpath` writes it.
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { node, parent, kind } = self;
+        write!(f, "{{\"node\": \"{node}\", \"parent\": \"{parent}\", \"action\": \"{kind}\"}}")
+    }
+}
+
+/// Move each block's [`REPLAY_ARRIVES`] ahead of its replay result where they are out of
+/// order, by swapping the two.
+fn arrivals_first(actions: &mut [Action]) {
+    for i in 0..actions.len() {
+        if !actions[i].is_replay_result() {
+            continue;
+        }
+        let node = actions[i].node;
+        if let Some(j) = actions[i + 1..].iter().position(|a| a.node == node && a.kind == REPLAY_ARRIVES) {
+            actions.swap(i, i + 1 + j);
+        }
+    }
+}
+
+/// Draws a tree, a node per line, and flattens it into actions in preorder.
 ///
 /// Each canonical node, paired with its certificates in `canonical`, is marked `finalize`,
 /// or `skip` if its slot is skipped, followed by the certificates; every other node is
@@ -162,19 +215,30 @@ fn canonical_path(nodes: &[Node]) -> Vec<Label> {
 ///
 /// Every block is then marked with what replay finds. A canonical block always replays
 /// completely, and a skipped slot has no block to replay. An off-path block is found dead
-/// when `is_dead` says so. Replay drops the descendants of a dead block without reporting
-/// them, so they are marked unreached, and `is_dead` is not asked about them.
+/// when `is_dead` says so, even under a dead block: an adversarial leader can build on a
+/// dead block, so its descendants still arrive and replay. `dead` in [`Self::visit`] is only
+/// the nearest dead block above, for the drawing.
+///
+/// Each certificate and replay result drawn is also recorded in `actions`, citing the node's
+/// parent the way the drawing does, and each replay result follows a [`REPLAY_ARRIVES`].
 struct Drawing<'a, F> {
     out: String,
-    canonical: &'a [(Label, &'a str)],
+    actions: Vec<Action>,
+    canonical: &'a [(Label, &'static str)],
     is_dead: F,
 }
 
 impl<F: FnMut() -> bool> Drawing<'_, F> {
     /// Draw `nodes`, the children of `parent`, and theirs, each line starting with `prefix`.
     /// `cited` is the block the nodes build on: `parent`, or the block before it if `parent`
-    /// is a skipped slot. It is drawn when it differs from `parent`. `dead` is the dead block
-    /// the nodes are under, if any.
+    /// is a skipped slot. It is drawn when it differs from `parent`. `dead` is the nearest dead
+    /// block the nodes are under, if any.
+    /// Record that `node`, which cites `parent`, arrives and that its replay ends in `result`.
+    fn replayed(&mut self, node: Label, parent: Label, result: &'static str) {
+        self.actions.push(Action { node, parent, kind: REPLAY_ARRIVES });
+        self.actions.push(Action { node, parent, kind: result });
+    }
+
     fn visit(&mut self, nodes: &[Node], parent: Label, cited: Label, dead: Option<Label>, prefix: &mut String) {
         let canonical = self.canonical;
         for (i, node) in nodes.iter().enumerate() {
@@ -186,6 +250,9 @@ impl<F: FnMut() -> bool> Drawing<'_, F> {
             let _ = write!(out, "{prefix}{}{}", if last { "└── " } else { "├── " }, node.label);
             if let Some(certificates) = settled {
                 let _ = write!(out, "  {}  {certificates}", if skipped { "skip" } else { "finalize" });
+                for certificate in certificates.split(" + ") {
+                    self.actions.push(Action { node: node.label, parent: cited, kind: certificate });
+                }
             }
             if let Some(i) = position.filter(|_| settled == Some(NOTAR_FALLBACK_CERT)) {
                 let finalized = canonical[i + 1..]
@@ -198,20 +265,20 @@ impl<F: FnMut() -> bool> Drawing<'_, F> {
                     None => out.push_str("  (waits on none)"),
                 }
             }
-            let dead = match dead {
-                Some(dead) => {
-                    let _ = write!(out, "  (unreached, under dead {dead})");
-                    Some(dead)
+            let dead = if skipped {
+                dead
+            } else if settled.is_some() {
+                self.out.push_str("  replay complete");
+                self.replayed(node.label, cited, REPLAY_COMPLETE);
+                dead
+            } else {
+                let is_dead = (self.is_dead)();
+                self.out.push_str(if is_dead { "  replay dead" } else { "  replay complete" });
+                if let Some(dead) = dead {
+                    let _ = write!(self.out, "  (under dead {dead})");
                 }
-                None if skipped => None,
-                None if settled.is_none() && (self.is_dead)() => {
-                    self.out.push_str("  replay dead");
-                    Some(node.label)
-                }
-                None => {
-                    self.out.push_str("  replay complete");
-                    None
-                }
+                self.replayed(node.label, cited, if is_dead { REPLAY_DEAD } else { REPLAY_COMPLETE });
+                if is_dead { Some(node.label) } else { dead }
             };
             let out = &mut self.out;
             if cited != parent {
@@ -234,7 +301,8 @@ fn main() -> Result<(), Error> {
         None => StdRng::from_os_rng(),
     };
     // Keep the generated trees stable for a seed while choosing which slots to skip, which
-    // certificates settle each canonical slot, and which off-path blocks are dead.
+    // certificates settle each canonical slot, which off-path blocks are dead, and how the
+    // actions are shuffled.
     let mut skip_rng = match args.seed {
         Some(seed) => StdRng::seed_from_u64(seed ^ 0x736b_6970_0000_0000),
         None => StdRng::from_os_rng(),
@@ -245,6 +313,10 @@ fn main() -> Result<(), Error> {
     };
     let mut dead_rng = match args.seed {
         Some(seed) => StdRng::seed_from_u64(seed ^ 0x6465_6164_0000_0000),
+        None => StdRng::from_os_rng(),
+    };
+    let mut shuffle_rng = match args.seed {
+        Some(seed) => StdRng::seed_from_u64(seed ^ 0x7368_7566_666c_6500),
         None => StdRng::from_os_rng(),
     };
     let mut generators = tuple_list!(DepthLimiter::new(STRUCTURE.inner(), args.depth));
@@ -268,7 +340,7 @@ fn main() -> Result<(), Error> {
         let (_tip, before_tip) = canonical.split_last().expect("a nonempty tree has a path");
         let skipped: Vec<Label> =
             before_tip.iter().copied().filter(|_| skip_rng.random_ratio(1, SKIP_ONE_IN)).collect();
-        let settled: Vec<(Label, &str)> = canonical
+        let settled: Vec<(Label, &'static str)> = canonical
             .iter()
             .map(|&label| {
                 let certificates = if skipped.contains(&label) {
@@ -282,17 +354,22 @@ fn main() -> Result<(), Error> {
         let root = Label { depth: 0, index: 0 };
         let mut drawing = Drawing {
             out: String::from("0\n"),
+            actions: Vec::new(),
             canonical: &settled,
             is_dead: || dead_rng.random_ratio(1, DEAD_ONE_IN),
         };
         drawing.visit(&roots, root, root, None, &mut String::new());
         let tree = drawing.out;
+        let mut actions = drawing.actions;
+        actions.shuffle(&mut shuffle_rng);
+        arrivals_first(&mut actions);
+        let actions: Vec<String> = actions.iter().map(ToString::to_string).collect();
         let path = canonical
             .iter()
             .map(|label| if skipped.contains(label) { format!("{label} (skip)") } else { label.to_string() })
             .collect::<Vec<_>>()
             .join(" → ");
-        println!("tree {iteration:06}\n{tree}path  {path}\n");
+        println!("tree {iteration:06}\n{tree}path  {path}\nactions\n[\n  {}\n]\n", actions.join(",\n  "));
     }
 
     println!("Drew {emitted} nonempty trees from {} attempts.", args.iterations);
