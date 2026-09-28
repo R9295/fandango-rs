@@ -4,7 +4,9 @@
 //! does it, and its nodes are labelled in preorder: depth, then index within the depth in
 //! letters. Depth is bounded only by the grammar depth limit. The canonical path runs from
 //! the root to the deepest node, the leftmost one on a tie. Each node on it is drawn with
-//! `finalize`; every other node, at any depth, is skipped.
+//! `finalize`, except that one in [`SKIP_ONE_IN`] canonical slots before the tip is skipped
+//! instead: the slot has no canonical block, so the nodes under it cite the block before it
+//! as their parent. Every other node, at any depth, is skipped without saying so.
 //!
 //! Usage:
 //! ```text
@@ -23,7 +25,7 @@ use fandango::tuple_list::tuple_list;
 use fandango::visitor::Visitor;
 use fandango::visitor::write::WriteVisitor;
 use fandango_runtime::operators::DepthLimiter;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use serde_json::Value;
 
@@ -50,6 +52,9 @@ struct Args {
 
 /// Most nodes across an entire depth.
 const MAX_WIDTH: usize = 5;
+
+/// One in this many canonical slots before the tip is skipped.
+const SKIP_ONE_IN: u32 = 4;
 
 /// A node's label: `0` for the root, else its depth then its index among the nodes of its
 /// depth, in letters, as in `alpenglow::Label`.
@@ -121,16 +126,35 @@ fn canonical_path(nodes: &[Node]) -> Vec<Label> {
     best
 }
 
-/// Draw `nodes`, and theirs, each line starting with `prefix`. Canonical nodes are marked
-/// `finalize`; every other node is skipped, which goes without saying.
-fn draw(out: &mut String, nodes: &[Node], canonical: &[Label], prefix: &mut String) {
+/// Draw `nodes`, the children of `parent`, and theirs, each line starting with `prefix`.
+/// Canonical nodes are marked `finalize`, or `skip` if their slot is skipped; every other
+/// node is skipped, which goes without saying. `cited` is the block the nodes build on:
+/// `parent`, or the block before it if `parent` is a skipped slot. It is drawn when it
+/// differs from `parent`.
+fn draw(
+    out: &mut String,
+    nodes: &[Node],
+    canonical: &[Label],
+    skipped: &[Label],
+    parent: Label,
+    cited: Label,
+    prefix: &mut String,
+) {
     for (i, node) in nodes.iter().enumerate() {
         let last = i + 1 == nodes.len();
-        let mark = if canonical.contains(&node.label) { "  finalize" } else { "" };
+        let mut mark = match (canonical.contains(&node.label), skipped.contains(&node.label)) {
+            (true, true) => String::from("  skip"),
+            (true, false) => String::from("  finalize"),
+            (false, _) => String::new(),
+        };
+        if cited != parent {
+            mark += &format!("  (parent {cited})");
+        }
         *out += &format!("{prefix}{}{}{mark}\n", if last { "└── " } else { "├── " }, node.label);
         let len = prefix.len();
         prefix.push_str(if last { "    " } else { "│   " });
-        draw(out, &node.children, canonical, prefix);
+        let next = if skipped.contains(&node.label) { cited } else { node.label };
+        draw(out, &node.children, canonical, skipped, node.label, next, prefix);
         prefix.truncate(len);
     }
 }
@@ -139,6 +163,11 @@ fn main() -> Result<(), Error> {
     let args = Args::parse();
     let mut rng = match args.seed {
         Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::from_os_rng(),
+    };
+    // Keep the generated trees stable for a seed while choosing which slots to skip.
+    let mut skip_rng = match args.seed {
+        Some(seed) => StdRng::seed_from_u64(seed ^ 0x736b_6970_0000_0000),
         None => StdRng::from_os_rng(),
     };
     let mut generators = tuple_list!(DepthLimiter::new(STRUCTURE.inner(), args.depth));
@@ -159,9 +188,17 @@ fn main() -> Result<(), Error> {
         emitted += 1;
 
         let canonical = canonical_path(&roots);
+        let (_tip, before_tip) = canonical.split_last().expect("a nonempty tree has a path");
+        let skipped: Vec<Label> =
+            before_tip.iter().copied().filter(|_| skip_rng.random_ratio(1, SKIP_ONE_IN)).collect();
         let mut tree = String::from("0\n");
-        draw(&mut tree, &roots, &canonical, &mut String::new());
-        let path = canonical.iter().map(ToString::to_string).collect::<Vec<_>>().join(" → ");
+        let root = Label { depth: 0, index: 0 };
+        draw(&mut tree, &roots, &canonical, &skipped, root, root, &mut String::new());
+        let path = canonical
+            .iter()
+            .map(|label| if skipped.contains(label) { format!("{label} (skip)") } else { label.to_string() })
+            .collect::<Vec<_>>()
+            .join(" → ");
         println!("tree {iteration:06}\n{tree}path  {path}\n");
     }
 
