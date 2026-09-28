@@ -11,6 +11,10 @@
 //! Each canonical node also shows the certificates that settle it: a skipped slot gets
 //! `SKIP_CERT`, and a finalized one gets one of [`FINALIZE_WAYS`], picked uniformly.
 //!
+//! Every block also shows what replay finds: `replay complete`, or, for one in
+//! [`DEAD_ONE_IN`] blocks off the canonical path, `replay dead`, which leaves its
+//! descendants unreached. A skipped slot has no block to replay.
+//!
 //! Usage:
 //! ```text
 //! RUSTFLAGS="-Znext-solver" cargo run -p fandango-targets --example consensus_tree -- [-n ITERATIONS] [-s SEED] [-d DEPTH]
@@ -68,6 +72,9 @@ const FINALIZE_WAYS: [&str; 4] = [
     "FAST_FINALIZE_CERT",
     "FAST_FINALIZE_CERT + NOTARIZE_CERT",
 ];
+
+/// One in this many off-path blocks is found dead by replay.
+const DEAD_ONE_IN: u32 = 4;
 
 /// The certificate that skips a canonical slot.
 const SKIP_CERT: &str = "SKIP_CERT";
@@ -145,44 +152,78 @@ fn canonical_path(nodes: &[Node]) -> Vec<Label> {
     best
 }
 
-/// Draw `nodes`, the children of `parent`, and theirs, each line starting with `prefix`.
+/// Draws a tree, a node per line.
+///
 /// Each canonical node, paired with its certificates in `canonical`, is marked `finalize`,
 /// or `skip` if its slot is skipped, followed by the certificates; every other node is
 /// skipped, which goes without saying. A node settled by [`NOTAR_FALLBACK_CERT`] also names
 /// the finalization it waits on: that of the next canonical node settled by any other
-/// certificates but [`SKIP_CERT`], or none. `cited` is the block the nodes build on: `parent`,
-/// or the block before it if `parent` is a skipped slot. It is drawn when it differs from
-/// `parent`.
-fn draw(out: &mut String, nodes: &[Node], canonical: &[(Label, &str)], parent: Label, cited: Label, prefix: &mut String) {
-    for (i, node) in nodes.iter().enumerate() {
-        let last = i + 1 == nodes.len();
-        let position = canonical.iter().position(|&(label, _)| label == node.label);
-        let settled = position.map(|i| canonical[i].1);
-        let skipped = settled == Some(SKIP_CERT);
-        let _ = write!(out, "{prefix}{}{}", if last { "└── " } else { "├── " }, node.label);
-        if let Some(certificates) = settled {
-            let _ = write!(out, "  {}  {certificates}", if skipped { "skip" } else { "finalize" });
-        }
-        if let Some(i) = position.filter(|_| settled == Some(NOTAR_FALLBACK_CERT)) {
-            let finalized = canonical[i + 1..]
-                .iter()
-                .find(|&&(_, certificates)| certificates != SKIP_CERT && certificates != NOTAR_FALLBACK_CERT);
-            match finalized {
-                Some((label, _)) => {
-                    let _ = write!(out, "  (waits on finalization of {label})");
-                }
-                None => out.push_str("  (waits on none)"),
+/// certificates but [`SKIP_CERT`], or none.
+///
+/// Every block is then marked with what replay finds. A canonical block always replays
+/// completely, and a skipped slot has no block to replay. An off-path block is found dead
+/// when `is_dead` says so. Replay drops the descendants of a dead block without reporting
+/// them, so they are marked unreached, and `is_dead` is not asked about them.
+struct Drawing<'a, F> {
+    out: String,
+    canonical: &'a [(Label, &'a str)],
+    is_dead: F,
+}
+
+impl<F: FnMut() -> bool> Drawing<'_, F> {
+    /// Draw `nodes`, the children of `parent`, and theirs, each line starting with `prefix`.
+    /// `cited` is the block the nodes build on: `parent`, or the block before it if `parent`
+    /// is a skipped slot. It is drawn when it differs from `parent`. `dead` is the dead block
+    /// the nodes are under, if any.
+    fn visit(&mut self, nodes: &[Node], parent: Label, cited: Label, dead: Option<Label>, prefix: &mut String) {
+        let canonical = self.canonical;
+        for (i, node) in nodes.iter().enumerate() {
+            let last = i + 1 == nodes.len();
+            let out = &mut self.out;
+            let position = canonical.iter().position(|&(label, _)| label == node.label);
+            let settled = position.map(|i| canonical[i].1);
+            let skipped = settled == Some(SKIP_CERT);
+            let _ = write!(out, "{prefix}{}{}", if last { "└── " } else { "├── " }, node.label);
+            if let Some(certificates) = settled {
+                let _ = write!(out, "  {}  {certificates}", if skipped { "skip" } else { "finalize" });
             }
+            if let Some(i) = position.filter(|_| settled == Some(NOTAR_FALLBACK_CERT)) {
+                let finalized = canonical[i + 1..]
+                    .iter()
+                    .find(|&&(_, certificates)| certificates != SKIP_CERT && certificates != NOTAR_FALLBACK_CERT);
+                match finalized {
+                    Some((label, _)) => {
+                        let _ = write!(out, "  (waits on finalization of {label})");
+                    }
+                    None => out.push_str("  (waits on none)"),
+                }
+            }
+            let dead = match dead {
+                Some(dead) => {
+                    let _ = write!(out, "  (unreached, under dead {dead})");
+                    Some(dead)
+                }
+                None if skipped => None,
+                None if settled.is_none() && (self.is_dead)() => {
+                    self.out.push_str("  replay dead");
+                    Some(node.label)
+                }
+                None => {
+                    self.out.push_str("  replay complete");
+                    None
+                }
+            };
+            let out = &mut self.out;
+            if cited != parent {
+                let _ = write!(out, "  (parent {cited})");
+            }
+            out.push('\n');
+            let len = prefix.len();
+            prefix.push_str(if last { "    " } else { "│   " });
+            let next = if skipped { cited } else { node.label };
+            self.visit(&node.children, node.label, next, dead, prefix);
+            prefix.truncate(len);
         }
-        if cited != parent {
-            let _ = write!(out, "  (parent {cited})");
-        }
-        out.push('\n');
-        let len = prefix.len();
-        prefix.push_str(if last { "    " } else { "│   " });
-        let next = if skipped { cited } else { node.label };
-        draw(out, &node.children, canonical, node.label, next, prefix);
-        prefix.truncate(len);
     }
 }
 
@@ -192,14 +233,18 @@ fn main() -> Result<(), Error> {
         Some(seed) => StdRng::seed_from_u64(seed),
         None => StdRng::from_os_rng(),
     };
-    // Keep the generated trees stable for a seed while choosing which slots to skip and
-    // which certificates settle each canonical slot.
+    // Keep the generated trees stable for a seed while choosing which slots to skip, which
+    // certificates settle each canonical slot, and which off-path blocks are dead.
     let mut skip_rng = match args.seed {
         Some(seed) => StdRng::seed_from_u64(seed ^ 0x736b_6970_0000_0000),
         None => StdRng::from_os_rng(),
     };
     let mut certificate_rng = match args.seed {
         Some(seed) => StdRng::seed_from_u64(seed ^ 0x6365_7274_0000_0000),
+        None => StdRng::from_os_rng(),
+    };
+    let mut dead_rng = match args.seed {
+        Some(seed) => StdRng::seed_from_u64(seed ^ 0x6465_6164_0000_0000),
         None => StdRng::from_os_rng(),
     };
     let mut generators = tuple_list!(DepthLimiter::new(STRUCTURE.inner(), args.depth));
@@ -234,9 +279,14 @@ fn main() -> Result<(), Error> {
                 (label, certificates)
             })
             .collect();
-        let mut tree = String::from("0\n");
         let root = Label { depth: 0, index: 0 };
-        draw(&mut tree, &roots, &settled, root, root, &mut String::new());
+        let mut drawing = Drawing {
+            out: String::from("0\n"),
+            canonical: &settled,
+            is_dead: || dead_rng.random_ratio(1, DEAD_ONE_IN),
+        };
+        drawing.visit(&roots, root, root, None, &mut String::new());
+        let tree = drawing.out;
         let path = canonical
             .iter()
             .map(|label| if skipped.contains(label) { format!("{label} (skip)") } else { label.to_string() })
