@@ -22,11 +22,13 @@
 //! the block that node cites as its parent. Each replay result also comes with a
 //! `REPLAY_ARRIVES` action for its block, which the shuffle keeps ahead of the result: a
 //! block's replay cannot finish before the block arrives. Between each pair of actions,
-//! the clock advances by one of [`CLOCK_STEPS_MS`], picked by its weight.
+//! the clock advances by one of [`CLOCK_STEPS_MS`], picked by its weight. With `-o`, each
+//! action list is also written to `<OUT_DIR>/<ITERATION>.json` on one line, as
+//! `alpenglow_altpath` writes its corpus.
 //!
 //! Usage:
 //! ```text
-//! RUSTFLAGS="-Znext-solver" cargo run -p fandango-targets --example consensus_tree -- [-n ITERATIONS] [-s SEED] [-d DEPTH]
+//! RUSTFLAGS="-Znext-solver" cargo run -p fandango-targets --example consensus_tree -- [-n ITERATIONS] [-s SEED] [-d DEPTH] [-o OUT_DIR]
 //! ```
 
 extern crate alloc;
@@ -46,6 +48,8 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use serde_json::Value;
+use std::fs;
+use std::path::PathBuf;
 
 /// Base for the grammar stored in `consensus_tree.fan`.
 #[derive(Fandango)]
@@ -66,6 +70,10 @@ struct Args {
     /// Grammar depth limit, which bounds how deep a tree can grow
     #[arg(short, long, default_value = "40")]
     depth: usize,
+
+    /// Directory to write each tree's action list to as <ITERATION>.json
+    #[arg(short, long)]
+    out_dir: Option<PathBuf>,
 }
 
 /// Most nodes across an entire depth.
@@ -401,8 +409,21 @@ fn main() -> Result<(), Error> {
             .collect::<Vec<_>>()
             .join(" → ");
         println!("tree {iteration:06}\n{tree}path  {path}\nactions\n[\n  {}\n]\n", actions.join(",\n  "));
+
+        if let Some(dir) = &args.out_dir {
+            if emitted == 1 {
+                fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+            }
+            let path = dir.join(format!("{iteration:06}.json"));
+            fs::write(&path, format!("[{}]\n", actions.join(", ")))
+                .with_context(|| format!("could not write {}", path.display()))?;
+        }
     }
 
-    println!("Drew {emitted} nonempty trees from {} attempts.", args.iterations);
+    match &args.out_dir {
+        Some(_) if emitted == 0 => println!("No nonempty trees after {} attempts; no corpus written.", args.iterations),
+        Some(dir) => println!("Wrote {emitted} nonempty trees from {} attempts to {}.", args.iterations, dir.display()),
+        None => println!("Drew {emitted} nonempty trees from {} attempts.", args.iterations),
+    }
     Ok(())
 }
