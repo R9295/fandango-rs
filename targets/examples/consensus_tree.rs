@@ -10,9 +10,9 @@
 //!
 //! Every block shows what replay finds: `replay complete`, or, for one in [`DEAD_ONE_IN`]
 //! blocks off the canonical path, `replay dead`. A skipped slot has no block to replay. An
-//! adversarial leader can still build on a dead block, so its descendants still arrive, and
-//! replay finds each of them dead or complete like any other off-path block. The drawing
-//! notes the dead block they are under.
+//! adversarial leader can still build on a dead block, so its descendants still arrive, but
+//! replay finds each of them dead too, as Firedancer's replay marks a dead block's whole
+//! subtree dead. The drawing notes the dead block they are under.
 //!
 //! Each canonical node also shows the certificates that settle it: one of [`SKIP_WAYS`] for
 //! a skipped slot, else one of [`FINALIZE_WAYS`], picked uniformly among the ways its slot
@@ -239,8 +239,8 @@ struct Found {
 
 /// Find what replay does with each node in preorder. A canonical block always replays
 /// completely, and a skipped slot has no block to replay. An off-path block is found dead
-/// when `is_dead` says so, even under a dead block: an adversarial leader can build on a
-/// dead block, so its descendants still arrive and replay.
+/// when `is_dead` says so, and always under a dead block: an adversarial leader can build
+/// on a dead block, so its descendants still arrive, but replay marks them dead.
 fn replay(
     nodes: &[Node],
     canonical: &[Label],
@@ -253,7 +253,7 @@ fn replay(
         let label = node.label;
         let result = if skipped.contains(&label) {
             None
-        } else if canonical.contains(&label) || !is_dead() {
+        } else if canonical.contains(&label) || (under.is_none() && !is_dead()) {
             Some(REPLAY_COMPLETE)
         } else {
             Some(REPLAY_DEAD)
