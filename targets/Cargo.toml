@@ -47,7 +47,6 @@ required-features = ["alpenglow", "static_defs"]
 [[example]]
 name = "alpenglow_seqcov"
 path = "examples/alpenglow_seqcov.rs"
-required-features = ["alpenglow", "static_defs"]
 
 [[example]]
 name = "consensus_tree"
