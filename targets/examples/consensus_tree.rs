@@ -23,8 +23,9 @@
 //! Each tree is then flattened into a shuffled JSON list of actions, as `alpenglow_altpath`
 //! does: every certificate and replay result above becomes one action naming its node and
 //! the block that node cites as its parent. Each replay result also comes with a
-//! `REPLAY_ARRIVES` action for its block, which the shuffle keeps ahead of the result: a
-//! block's replay cannot finish before the block arrives. Between each pair of actions,
+//! `REPLAY_ARRIVES` action for its block. The shuffle keeps a block's replay result after its
+//! arrival and after its parent's replay result, as Firedancer's replay only starts a block
+//! once its parent's bank is frozen. Between each pair of actions,
 //! the clock advances by one of [`CLOCK_STEPS_MS`], picked by its weight. With `-o`, each
 //! action list is also written to `<OUT_DIR>/<ITERATION>.json` on one line, as
 //! `alpenglow_altpath` writes its corpus.
@@ -287,18 +288,32 @@ impl fmt::Display for Action {
     }
 }
 
-/// Move each block's [`REPLAY_ARRIVES`] ahead of its replay result where they are out of
-/// order, by swapping the two.
-fn arrivals_first(actions: &mut [Action]) {
-    for i in 0..actions.len() {
-        if !actions[i].is_replay_result() {
-            continue;
-        }
-        let node = actions[i].node;
-        if let Some(j) = actions[i + 1..].iter().position(|a| a.node == node && a.kind == REPLAY_ARRIVES) {
-            actions.swap(i, i + 1 + j);
+/// Put shuffled actions in an order replay can report them in: a block's replay result waits
+/// for its [`REPLAY_ARRIVES`] and for its parent's replay result. Every other action, and each
+/// result once it is ready, keeps its shuffled place.
+fn replay_order(shuffled: Vec<Action>) -> Vec<Action> {
+    let root = Label { depth: 0, index: 0 };
+    let mut arrived = Vec::new();
+    let mut replayed = vec![root];
+    let mut waiting = Vec::new();
+    let mut ordered = Vec::with_capacity(shuffled.len());
+    let ready = |a: &Action, arrived: &[Label], replayed: &[Label]| {
+        !a.is_replay_result() || (arrived.contains(&a.node) && replayed.contains(&a.parent))
+    };
+    for action in shuffled {
+        waiting.push(action);
+        while let Some(i) = waiting.iter().position(|a| ready(a, &arrived, &replayed)) {
+            let action = waiting.remove(i);
+            match action.kind {
+                REPLAY_ARRIVES => arrived.push(action.node),
+                _ if action.is_replay_result() => replayed.push(action.node),
+                _ => {}
+            }
+            ordered.push(action);
         }
     }
+    assert!(waiting.is_empty(), "every block's parent is the root or replays");
+    ordered
 }
 
 /// Draws a tree, a node per line, and flattens it into actions in preorder.
@@ -484,7 +499,7 @@ fn main() -> Result<(), Error> {
         let tree = drawing.out;
         let mut actions = drawing.actions;
         actions.shuffle(&mut shuffle_rng);
-        arrivals_first(&mut actions);
+        let actions = replay_order(actions);
         let mut stepped = Vec::with_capacity(2 * actions.len());
         for (i, action) in actions.iter().enumerate() {
             if i > 0 {
