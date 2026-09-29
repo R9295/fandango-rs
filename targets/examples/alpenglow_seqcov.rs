@@ -15,7 +15,7 @@
 //! children, nor is `18a`, the canonical tip, and slot 18 is never skipped.
 //!
 //! A t-sequence is covered once some scenario has those t events in that order, not
-//! necessarily adjacent.  Up to 10 million t-sequences, every one is counted; past that
+//! necessarily adjacent.  Up to 10 million t-sequences (`-x`), every one is counted; past that
 //! (t = 3 on), coverage is estimated from random t-sequences of the universe, drawn
 //! uniformly, with a 95% interval, as the corpus holds too many distinct ones to keep.  Its
 //! universe is every ordered t-tuple of distinct events that one scenario could hold: one
@@ -25,16 +25,23 @@
 //! off-chain nodes in a slot, as the canonical node takes one of its 5 labels, and at most 3
 //! notar fallback certificates for them, beside a notar fallback certificate for the
 //! canonical node, 2 beside a lone notar or a skip certificate, and none beside the others.
+//! A notar fallback certificate for the canonical node comes with others for 3 live blocks
+//! or none, so beside any, its slot holds at most one dead block, and slot 1 none.
 //! Slot 1 holds the root's children, at most 4, so it has at most 3 off-chain nodes, a to d.
-//! No tree is deeper than 18 slots, so slot 18 is never skipped, and `18a`, its leftmost
-//! node, is always the canonical tip.  Other constraints (child counts, the leftmost deepest
-//! tip, which block an off-chain node builds on and so which replay results it waits on, and
-//! the blocks under a dead one being dead) are not modelled.
+//! Trees reach at most 18 slots, as `consensus_tree -d 90` grows them, so slot 18 is never
+//! skipped, and `18a`, its leftmost node, is always the canonical tip.  Other constraints
+//! (child counts, the leftmost deepest tip, which block an off-chain node builds on and so
+//! which replay results it waits on, and the blocks under a dead one being dead) are not
+//! modelled.
 //!
 //! Usage:
 //! ```text
-//! cargo run --release -p fandango-targets --example alpenglow_seqcov -- CORPUS_DIR [-t MAX_T] [-n SAMPLES] [-s SEED] [-j JOBS]
+//! cargo run --release -p fandango-targets --example alpenglow_seqcov -- CORPUS_DIR [-t MAX_T] [-n SAMPLES] [-s SEED] [-j JOBS] [-k KEEP_DIR] [-x EXACT_MAX] [-m MISSING]
 //! ```
+//!
+//! With `-k`, the scenarios already in `KEEP_DIR` are counted first, and each scenario of
+//! `CORPUS_DIR` that then covers a t-sequence or sample none before it did is copied into
+//! `KEEP_DIR` as `<CORPUS_DIR name>-<file name>`; coverage is reported for both together.
 
 use anyhow::{Context, Error, bail};
 use clap::Parser;
@@ -67,6 +74,19 @@ struct Args {
     /// Threads [default: one per CPU]
     #[arg(short, long)]
     jobs: Option<usize>,
+
+    /// Directory of scenarios to count first, and to copy each scenario that covers more into
+    #[arg(short, long)]
+    keep: Option<PathBuf>,
+
+    /// Largest universe counted exactly, rather than sampled; it takes a bit for each of 540^t
+    /// packed sequences
+    #[arg(short = 'x', long, default_value = "10000000")]
+    exact_max: u128,
+
+    /// Missing sequences to list for each t [default: 3 for a sampled t, none for a counted one]
+    #[arg(short, long)]
+    missing: Option<usize>,
 }
 
 /// A set of packed t-sequences, one bit each, that threads add to together.
@@ -77,12 +97,11 @@ impl Bitset {
         Self((0..bits.div_ceil(64)).map(|_| AtomicU64::new(0)).collect())
     }
 
-    fn insert(&self, key: u64) {
+    /// Add a key, and say whether it is new.
+    fn insert(&self, key: u64) -> bool {
         let (word, bit) = (&self.0[(key / 64) as usize], 1u64 << (key % 64));
         /* Most keys are already set, and a load leaves the cache line shared */
-        if word.load(Relaxed) & bit == 0 {
-            word.fetch_or(bit, Relaxed);
-        }
+        word.load(Relaxed) & bit == 0 && word.fetch_or(bit, Relaxed) & bit == 0
     }
 
     fn contains(&self, key: u64) -> bool {
@@ -94,10 +113,7 @@ impl Bitset {
     }
 }
 
-/// Largest universe counted exactly, rather than sampled.
-const EXACT_MAX: u128 = 10_000_000;
-
-/// Deepest slot: `consensus_tree`'s default depth limit grows trees at most this deep.
+/// Deepest slot: `consensus_tree -d 90` grows trees at most this deep.
 const SLOTS: usize = 18;
 /// Most nodes in a slot.
 const WIDTH: usize = 5;
@@ -223,6 +239,7 @@ fn feasible(events: &[Event]) -> bool {
     let mut mode = [None; SLOTS + 1];
     let mut nodes = [[false; WIDTH]; SLOTS + 1];
     let mut fallbacks = [0usize; SLOTS + 1];
+    let mut dead = [0usize; SLOTS + 1];
     for (i, &a) in events.iter().enumerate() {
         let (slot, class) = (slot_of(a), class_of(a));
         if class == SKIP && slot == SLOTS {
@@ -237,6 +254,7 @@ fn feasible(events: &[Event]) -> bool {
             }
             nodes[slot][index] = true;
             fallbacks[slot] += usize::from(class == OFF_CHAIN + OFF_FALLBACK);
+            dead[slot] += usize::from(class == OFF_CHAIN + OFF_DEAD);
         }
         if !events[..i].iter().all(|&b| compatible(b, a)) {
             return false;
@@ -244,8 +262,17 @@ fn feasible(events: &[Event]) -> bool {
     }
     (1..=SLOTS).all(|slot| {
         nodes[slot].iter().filter(|&&n| n).count() <= max_nodes(slot)
-            && fallbacks[slot] <= mode[slot].map_or(OTHERS[0], |m| OTHERS[m])
+            && fallbacks_fit(slot, mode[slot], fallbacks[slot], dead[slot])
     })
+}
+
+/// Whether a slot settled in `mode` can give notar fallback certificates to `fallbacks`
+/// off-chain blocks beside `dead` dead ones.
+fn fallbacks_fit(slot: usize, mode: Option<usize>, fallbacks: usize, dead: usize) -> bool {
+    /* A notar fallback certificate for the canonical block comes with others for 3 live
+       blocks, or none */
+    let crowded = mode == Some(0) && fallbacks > 0 && dead + OTHERS[0] > max_nodes(slot);
+    fallbacks <= mode.map_or(OTHERS[0], |m| OTHERS[m]) && !crowded
 }
 
 /// A slot's feasible event sets, counted by size, whether they hold the canonical block's
@@ -254,16 +281,16 @@ fn feasible(events: &[Event]) -> bool {
 fn slot_sets(slot: usize) -> HashMap<(usize, bool, bool, usize), u128> {
     /* Each off-chain node holds some of its events: at most one replay result, and no notar
        fallback certificate for a dead block.  Count the nodes' sets together by size, pairs
-       of arrival and result, nodes and notar fallback certificates. */
+       of arrival and result, nodes, notar fallback certificates and dead blocks. */
     let bit = |kind: usize| 1u32 << kind;
     let node_sets: Vec<u32> = (0..1u32 << PER_NODE)
         .filter(|s| s & (bit(OFF_REPLAY) | bit(OFF_DEAD)) != bit(OFF_REPLAY) | bit(OFF_DEAD))
         .filter(|s| s & (bit(OFF_DEAD) | bit(OFF_FALLBACK)) != bit(OFF_DEAD) | bit(OFF_FALLBACK))
         .collect();
-    let mut off: HashMap<(usize, usize, usize, usize), u128> = HashMap::from([((0, 0, 0, 0), 1)]);
+    let mut off: HashMap<(usize, usize, usize, usize, usize), u128> = HashMap::from([((0, 0, 0, 0, 0), 1)]);
     for _ in (0..WIDTH).filter(|&i| off_chain_label(slot, i)) {
         let mut next = HashMap::new();
-        for (&(size, pairs, nodes, fallbacks), &count) in &off {
+        for (&(size, pairs, nodes, fallbacks, dead), &count) in &off {
             for &s in &node_sets {
                 let pair = s & bit(OFF_ARRIVE) != 0 && s & (bit(OFF_REPLAY) | bit(OFF_DEAD)) != 0;
                 let key = (
@@ -271,6 +298,7 @@ fn slot_sets(slot: usize) -> HashMap<(usize, bool, bool, usize), u128> {
                     pairs + usize::from(pair),
                     nodes + usize::from(s != 0),
                     fallbacks + usize::from(s & bit(OFF_FALLBACK) != 0),
+                    dead + usize::from(s & bit(OFF_DEAD) != 0),
                 );
                 *next.entry(key).or_default() += count;
             }
@@ -287,9 +315,8 @@ fn slot_sets(slot: usize) -> HashMap<(usize, bool, bool, usize), u128> {
             if mode == Some(SKIP) && (arrive || replay) {
                 continue;
             }
-            let max_fallbacks = mode.map_or(OTHERS[0], |m| OTHERS[m]);
-            for (&(size, pairs, nodes, fallbacks), &count) in &off {
-                if nodes <= max_nodes(slot) && fallbacks <= max_fallbacks {
+            for (&(size, pairs, nodes, fallbacks, dead), &count) in &off {
+                if nodes <= max_nodes(slot) && fallbacks_fit(slot, mode, fallbacks, dead) {
                     let size = size + usize::from(mode.is_some()) + usize::from(arrive) + usize::from(replay);
                     *sets.entry((size, arrive, replay, pairs)).or_default() += count;
                 }
@@ -444,6 +471,29 @@ fn events(text: &str) -> Result<Vec<Event>, Error> {
     Ok(events.into_iter().map(|(_, e)| e).collect())
 }
 
+/// The first `n` feasible t-sequences, in packed order, that `seen` lacks.
+fn unseen(seen: &Bitset, t: usize, n: usize) -> Vec<Vec<Event>> {
+    let mut missing = Vec::new();
+    for key in 0..EVENTS.pow(t as u32) as u64 {
+        if missing.len() == n {
+            break;
+        }
+        if seen.contains(key) {
+            continue;
+        }
+        let mut sequence = vec![0; t];
+        let mut rest = key;
+        for e in sequence.iter_mut().rev() {
+            *e = (rest % EVENTS as u64) as Event;
+            rest /= EVENTS as u64;
+        }
+        if feasible(&sequence) {
+            missing.push(sequence);
+        }
+    }
+    missing
+}
+
 /// Every in-order t-subsequence of `order`, packed base `EVENTS` into a u64.
 fn subsequences(order: &[Event], t: usize, into: &mut impl FnMut(u64)) {
     fn go(order: &[Event], t: usize, key: u64, into: &mut impl FnMut(u64)) {
@@ -464,25 +514,37 @@ fn main() -> Result<(), Error> {
         bail!("t must be 1 to 14, as {EVENTS}^t must fit a u128");
     }
     let universe = universe(&(1..=SLOTS).collect::<Vec<_>>(), args.t);
-    let exact: Vec<bool> = universe.iter().map(|&u| u <= EXACT_MAX).collect();
+    let exact: Vec<bool> = universe.iter().map(|&u| u <= args.exact_max).collect();
     let seen: Vec<Bitset> = (0..=args.t).map(|t| Bitset::new(if t > 0 && exact[t] { EVENTS.pow(t as u32) } else { 0 })).collect();
     let mut rng = StdRng::seed_from_u64(args.seed);
     let samples: Vec<Vec<Vec<Event>>> =
         (0..=args.t).map(|t| if t == 0 || exact[t] { Vec::new() } else { (0..args.samples).map(|_| draw(&mut rng, t)).collect() }).collect();
     let found: Vec<Vec<AtomicBool>> = samples.iter().map(|s| s.iter().map(|_| AtomicBool::new(false)).collect()).collect();
 
-    let paths: Vec<PathBuf> = fs::read_dir(&args.corpus)
-        .with_context(|| format!("could not read {}", args.corpus.display()))?
-        .map(|entry| entry.map(|e| e.path()))
-        .collect::<Result<_, _>>()?;
+    let list = |dir: &PathBuf| -> Result<Vec<PathBuf>, Error> {
+        let paths = fs::read_dir(dir).with_context(|| format!("could not read {}", dir.display()))?;
+        let mut paths: Vec<PathBuf> = paths.map(|entry| entry.map(|e| e.path())).collect::<Result<_, _>>()?;
+        paths.sort();
+        Ok(paths)
+    };
+    let kept = match &args.keep {
+        Some(dir) => {
+            fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+            list(dir)?
+        }
+        None => Vec::new(),
+    };
+    let paths = list(&args.corpus)?;
+    let prefix = args.corpus.file_name().context("a corpus directory without a name")?.to_string_lossy();
     let jobs = args.jobs.unwrap_or_else(|| thread::available_parallelism().map_or(1, |n| n.get()));
-    let next = AtomicUsize::new(0);
+    let copied = AtomicUsize::new(0);
 
     /* Each thread takes the next file until none are left, adding the sequences it finds
-       to the shared bitsets and flags */
-    let scan = || -> Result<(), Error> {
+       to the shared bitsets and flags, and, with `keep`, copying a file that adds any */
+    let scan = |paths: &[PathBuf], next: &AtomicUsize, keep: Option<&PathBuf>| -> Result<(), Error> {
         let mut unfound: Vec<Vec<usize>> = samples.iter().map(|s| (0..s.len()).collect()).collect();
         while let Some(path) = paths.get(next.fetch_add(1, Relaxed)) {
+            let mut new = false;
             let order = events(&fs::read_to_string(path)?).with_context(|| format!("could not parse {}", path.display()))?;
             if !feasible(&order) {
                 bail!("{}: events outside the modelled universe", path.display());
@@ -491,7 +553,7 @@ fn main() -> Result<(), Error> {
             order.iter().enumerate().for_each(|(i, &e)| position[e] = i);
             for t in 1..=args.t {
                 if exact[t] {
-                    subsequences(&order, t, &mut |key| seen[t].insert(key));
+                    subsequences(&order, t, &mut |key| new |= seen[t].insert(key));
                 } else {
                     unfound[t].retain(|&i| {
                         if found[t][i].load(Relaxed) {
@@ -499,20 +561,31 @@ fn main() -> Result<(), Error> {
                         }
                         let hit = in_order(&samples[t][i], &position);
                         if hit {
-                            found[t][i].store(true, Relaxed);
+                            new |= !found[t][i].swap(true, Relaxed);
                         }
                         !hit
                     });
                 }
             }
+            if let Some(dir) = keep.filter(|_| new) {
+                let to = dir.join(format!("{prefix}-{}", path.file_name().context("a file without a name")?.to_string_lossy()));
+                fs::copy(path, &to).with_context(|| format!("could not copy {} to {}", path.display(), to.display()))?;
+                copied.fetch_add(1, Relaxed);
+            }
         }
         Ok(())
     };
-    thread::scope(|scope| {
-        let workers: Vec<_> = (0..jobs).map(|_| scope.spawn(&scan)).collect();
-        workers.into_iter().try_for_each(|w| w.join().expect("scan thread panicked"))
-    })?;
-    let files = paths.len();
+    for (paths, keep) in [(&kept, None), (&paths, args.keep.as_ref())] {
+        let next = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            let workers: Vec<_> = (0..jobs).map(|_| scope.spawn(|| scan(paths, &next, keep))).collect();
+            workers.into_iter().try_for_each(|w| w.join().expect("scan thread panicked"))
+        })?;
+    }
+    let files = kept.len() + paths.len();
+    if let Some(dir) = &args.keep {
+        println!("kept {} of {} scenarios in {}", copied.load(Relaxed), paths.len(), dir.display());
+    }
     let uncovered: Vec<Vec<&Vec<Event>>> =
         samples.iter().zip(&found).map(|(s, f)| s.iter().zip(f).filter(|(_, f)| !f.load(Relaxed)).map(|(s, _)| s).collect()).collect();
 
@@ -521,12 +594,15 @@ fn main() -> Result<(), Error> {
         if exact[t] {
             let covered = seen[t].len();
             println!("t={t}: {covered}/{} sequences ({:.2}%)", universe[t], 100.0 * covered as f64 / universe[t] as f64);
+            for sequence in unseen(&seen[t], t, args.missing.unwrap_or(0)) {
+                println!("  missing: {}", sequence.iter().map(|&e| name(e)).collect::<Vec<_>>().join(" "));
+            }
         } else {
             let n = args.samples as f64;
             let p = (args.samples - uncovered[t].len()) as f64 / n;
             let margin = 1.96 * (p * (1.0 - p) / n).sqrt();
             println!("t={t}: {:.2}% +- {:.2}% of {} sequences, from {} samples", 100.0 * p, 100.0 * margin, universe[t], args.samples);
-            for sequence in uncovered[t].iter().take(3) {
+            for sequence in uncovered[t].iter().take(args.missing.unwrap_or(3)) {
                 println!("  missing: {}", sequence.iter().map(|&e| name(e)).collect::<Vec<_>>().join(" "));
             }
         }
@@ -659,6 +735,11 @@ mod tests {
         assert!(feasible(&[settle(2, SKIP), fallbacks[0], fallbacks[1]]));
         assert!(!feasible(&[settle(2, 2), fallbacks[0]]));
         assert!(!feasible(&[fallbacks.as_slice(), &[off_chain(2, 3, OFF_FALLBACK)]].concat()));
+        /* Beside a notar fallback certificate for the canonical block, others go to 3 live ones */
+        assert!(feasible(&[settle(2, 0), fallbacks[0], off_chain(2, 3, OFF_DEAD)]));
+        assert!(!feasible(&[settle(2, 0), fallbacks[0], off_chain(2, 3, OFF_DEAD), off_chain(2, 4, OFF_DEAD)]));
+        assert!(!feasible(&[settle(1, 0), off_chain(1, 0, OFF_DEAD), off_chain(1, 1, OFF_FALLBACK)]));
+        assert!(feasible(&[settle(1, 4), off_chain(1, 0, OFF_DEAD), off_chain(1, 1, OFF_FALLBACK)]));
     }
 
     #[test]
