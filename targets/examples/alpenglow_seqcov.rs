@@ -42,12 +42,17 @@
 //! With `-k`, the scenarios already in `KEEP_DIR` are counted first, and each scenario of
 //! `CORPUS_DIR` that then covers a t-sequence or sample none before it did is copied into
 //! `KEEP_DIR` as `<CORPUS_DIR name>-<file name>`; coverage is reported for both together.
+//! With `-g` as well, scenarios are instead picked greedily, the one covering the most
+//! sequences and samples none picked before it did first, and each copy's name starts with
+//! its rank, so the first N files are the best N found; coverage is reported every 1000, and
+//! `-p` stops after N picks.
 
 use anyhow::{Context, Error, bail};
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -87,6 +92,14 @@ struct Args {
     /// Missing sequences to list for each t [default: 3 for a sampled t, none for a counted one]
     #[arg(short, long)]
     missing: Option<usize>,
+
+    /// With -k, pick the scenarios greedily, most new sequences first, and rank their copies
+    #[arg(short, long, requires = "keep")]
+    greedy: bool,
+
+    /// With -g, stop after this many picks
+    #[arg(short, long, requires = "greedy")]
+    picks: Option<usize>,
 }
 
 /// A set of packed t-sequences, one bit each, that threads add to together.
@@ -575,12 +588,109 @@ fn main() -> Result<(), Error> {
         }
         Ok(())
     };
-    for (paths, keep) in [(&kept, None), (&paths, args.keep.as_ref())] {
+    let phases = if args.greedy { vec![(&kept, None)] } else { vec![(&kept, None), (&paths, args.keep.as_ref())] };
+    for (paths, keep) in phases {
         let next = AtomicUsize::new(0);
         thread::scope(|scope| {
             let workers: Vec<_> = (0..jobs).map(|_| scope.spawn(|| scan(paths, &next, keep))).collect();
             workers.into_iter().try_for_each(|w| w.join().expect("scan thread panicked"))
         })?;
+    }
+    if let Some(dir) = args.keep.as_ref().filter(|_| args.greedy) {
+        let load = |path: &PathBuf| -> Result<Vec<Event>, Error> {
+            let order = events(&fs::read_to_string(path)?).with_context(|| format!("could not parse {}", path.display()))?;
+            if !feasible(&order) {
+                bail!("{}: events outside the modelled universe", path.display());
+            }
+            Ok(order)
+        };
+        /* How many sequences and samples a scenario covers that none picked so far do, and,
+           with `add`, marking them covered */
+        let cover = |order: &[Event], add: bool| -> u64 {
+            let mut position = [usize::MAX; EVENTS];
+            order.iter().enumerate().for_each(|(i, &e)| position[e] = i);
+            let mut new = 0;
+            for t in 1..=args.t {
+                if exact[t] {
+                    subsequences(order, t, &mut |key| new += u64::from(if add { seen[t].insert(key) } else { !seen[t].contains(key) }));
+                } else {
+                    for (i, sample) in samples[t].iter().enumerate() {
+                        if !found[t][i].load(Relaxed) && in_order(sample, &position) {
+                            new += 1;
+                            if add {
+                                found[t][i].store(true, Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+            new
+        };
+        /* What each of `picks` would add, over all threads */
+        let gains = |picks: &[usize]| -> Result<Vec<u64>, Error> {
+            let next = AtomicUsize::new(0);
+            let out: Vec<AtomicU64> = picks.iter().map(|_| AtomicU64::new(0)).collect();
+            thread::scope(|scope| {
+                let workers: Vec<_> = (0..jobs.min(picks.len()))
+                    .map(|_| {
+                        scope.spawn(|| -> Result<(), Error> {
+                            loop {
+                                let k = next.fetch_add(1, Relaxed);
+                                let Some(&i) = picks.get(k) else { break };
+                                out[k].store(cover(&load(&paths[i])?, false), Relaxed);
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                workers.into_iter().try_for_each(|w| w.join().expect("gain thread panicked"))
+            })?;
+            Ok(out.into_iter().map(AtomicU64::into_inner).collect())
+        };
+        let report = |picked: usize| {
+            let parts: Vec<String> = (1..=args.t)
+                .map(|t| {
+                    let (covered, of) = if exact[t] {
+                        (seen[t].len(), universe[t])
+                    } else {
+                        (found[t].iter().filter(|f| f.load(Relaxed)).count() as u128, samples[t].len() as u128)
+                    };
+                    format!("t={t} {:.2}%", 100.0 * covered as f64 / of as f64)
+                })
+                .collect();
+            println!("picked {picked}: {}", parts.join(", "));
+        };
+
+        /* Lazy greedy: a scenario's gain only shrinks as others are picked, so a stale gain
+           bounds its fresh one.  Refresh the best bounds, a thread's worth at a time, and pick
+           the best fresh gain once no stale bound beats it. */
+        let all: Vec<usize> = (0..paths.len()).collect();
+        let mut heap: BinaryHeap<(u64, Reverse<usize>)> = gains(&all)?.into_iter().zip(all).map(|(g, i)| (g, Reverse(i))).collect();
+        let mut picked = 0;
+        while heap.peek().is_some_and(|&(bound, _)| bound > 0) && args.picks.is_none_or(|n| picked < n) {
+            let batch: Vec<usize> = (0..jobs).map_while(|_| heap.pop()).map(|(_, Reverse(i))| i).collect();
+            let fresh = gains(&batch)?;
+            let best = (0..batch.len()).max_by_key(|&k| (fresh[k], Reverse(batch[k]))).expect("a nonempty batch");
+            let beaten = heap.peek().is_some_and(|&(bound, _)| bound > fresh[best]);
+            for (k, (&i, &gain)) in batch.iter().zip(&fresh).enumerate() {
+                if gain > 0 && (beaten || k != best) {
+                    heap.push((gain, Reverse(i)));
+                }
+            }
+            if beaten || fresh[best] == 0 {
+                continue;
+            }
+            let path = &paths[batch[best]];
+            cover(&load(path)?, true);
+            picked += 1;
+            let to = dir.join(format!("{picked:06}-{prefix}-{}", path.file_name().context("a file without a name")?.to_string_lossy()));
+            fs::copy(path, &to).with_context(|| format!("could not copy {} to {}", path.display(), to.display()))?;
+            copied.fetch_add(1, Relaxed);
+            if picked % 1000 == 0 {
+                report(picked);
+            }
+        }
+        report(picked);
     }
     let files = kept.len() + paths.len();
     if let Some(dir) = &args.keep {

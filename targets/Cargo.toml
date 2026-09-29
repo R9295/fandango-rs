@@ -53,6 +53,10 @@ name = "consensus_tree"
 path = "examples/consensus_tree.rs"
 
 [[example]]
+name = "replay_tree"
+path = "examples/replay_tree.rs"
+
+[[example]]
 name = "xml_basic"
 path = "examples/xml_basic.rs"
 required-features = ["xml", "static_defs"]
