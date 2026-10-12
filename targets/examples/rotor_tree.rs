@@ -30,9 +30,8 @@
 //! The lineage is flattened into a shuffled JSON list of actions, as `consensus_tree` does,
 //! each naming its node and the block that node cites as its parent. A `SEND`, `LAST` or
 //! `INVALID` also names its FEC set as `fec`. The shuffle keeps each block's actions in the
-//! order above and every `FINAL` after the `LAST` of its block and of those above it. Between
-//! each pair of actions, the clock advances by one of [`CLOCK_STEPS_MS`], picked by its weight.
-//! With `-o`, each action list is also written to `<OUT_DIR>/<ITERATION>.json` on one line.
+//! order above and every `FINAL` after the `LAST` of its block and of those above it. With
+//! `-o`, each action list is also written to `<OUT_DIR>/<ITERATION>.json` on one line.
 //!
 //! Usage:
 //! ```text
@@ -99,12 +98,6 @@ const FINAL: &str = "FINAL";
 const INVALID: &str = "INVALID";
 /// A block's slot is declared skipped, which frees the block.
 const SKIPPED: &str = "SKIPPED";
-
-/// Milliseconds the clock advances between two actions, each with its weight out of
-/// [`CLOCK_WEIGHT_TOTAL`]: 50 ms and 100 ms 45% of the time each, 500 ms 10%.
-const CLOCK_STEPS_MS: [(u64, u32); 3] = [(50, 9), (100, 9), (500, 2)];
-/// The sum of the weights in [`CLOCK_STEPS_MS`].
-const CLOCK_WEIGHT_TOTAL: u32 = 20;
 
 /// A node's label: `0` for the root, else its depth, which is its slot, then its index among
 /// the nodes of its depth, in letters, as in `consensus_tree`. A lineage has one node per
@@ -313,18 +306,6 @@ fn draw(blocks: &[Block], ordered: &[Action]) -> String {
     out
 }
 
-/// Pick a clock step from [`CLOCK_STEPS_MS`] by weight.
-fn clock_step(rng: &mut StdRng) -> u64 {
-    let mut pick = rng.random_range(0..CLOCK_WEIGHT_TOTAL);
-    for (ms, weight) in CLOCK_STEPS_MS {
-        if pick < weight {
-            return ms;
-        }
-        pick -= weight;
-    }
-    unreachable!("the weights sum to CLOCK_WEIGHT_TOTAL")
-}
-
 /// A reproducible RNG for `seed` set apart by `salt`, or one from OS entropy without a seed.
 fn stream(seed: Option<u64>, salt: u64) -> StdRng {
     match seed {
@@ -336,11 +317,10 @@ fn stream(seed: Option<u64>, salt: u64) -> StdRng {
 fn main() -> Result<(), Error> {
     let args = Args::parse();
     let mut rng = stream(args.seed, 0);
-    // Keep the generated lineages stable for a seed while choosing how each one ends, how the
-    // actions are shuffled, and how far the clock steps between them.
+    // Keep the generated lineages stable for a seed while choosing how each one ends and how
+    // the actions are shuffled.
     let mut fate_rng = stream(args.seed, 0x6661_7465_0000_0000);
     let mut shuffle_rng = stream(args.seed, 0x7368_7566_666c_6500);
-    let mut clock_rng = stream(args.seed, 0x636c_6f63_6b00_0000);
     let mut generators = tuple_list!(DepthLimiter::new(STRUCTURE.inner(), args.depth));
 
     if let Some(dir) = &args.out_dir {
@@ -371,15 +351,7 @@ fn main() -> Result<(), Error> {
         let actions = order(actions, blocks.len());
         let tree = draw(&blocks, &actions);
 
-        let mut stepped = Vec::with_capacity(2 * actions.len());
-        for (i, action) in actions.iter().enumerate() {
-            if i > 0 {
-                let ms = clock_step(&mut clock_rng);
-                stepped.push(format!("{{\"action\": \"CLOCK\", \"ms\": {ms}}}"));
-            }
-            stepped.push(action.to_string());
-        }
-        let actions = stepped;
+        let actions: Vec<String> = actions.iter().map(ToString::to_string).collect();
         let path = blocks
             .iter()
             .map(|block| match block.fate {
