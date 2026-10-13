@@ -1,8 +1,12 @@
-<start> ::= '{"blocks": [' <blocks> ']}\n' ;
+<start> ::= '{"children": ' <children> '}\n' ;
 
-<blocks> ::= <block>
-    | <block> ', ' <blocks>
-    | <block> ', ' <blocks>
-    | <block> ', ' <blocks> ;
-<block> ::= '{"fecs": ' <fecs> '}' ;
+<children> ::= '[]'
+    | '[]'
+    | '[' <node> ']'
+    | '[' <node> ']'
+    | '[' <node> ']'
+    | '[' <node> ', ' <node> ']'
+    | '[' <node> ', ' <node> ']'
+    | '[' <node> ', ' <node> ', ' <node> ']' ;
+<node> ::= '{"fecs": ' <fecs> ', "children": ' <children> '}' ;
 <fecs> ::= '1' | '2' | '3' | '4' ;
