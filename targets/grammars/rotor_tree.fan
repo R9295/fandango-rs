@@ -1,12 +1,21 @@
-<start> ::= '{"children": ' <children> '}\n' ;
+<start> ::= '{"blocks": [' <blocks> ']}\n' ;
 
-<children> ::= '[]'
+<blocks> ::= <block>
+    | <block> ', ' <blocks>
+    | <block> ', ' <blocks>
+    | <block> ', ' <blocks>
+    | <block> ', ' <blocks>
+    | <block> ', ' <blocks>
+    | <block> ', ' <blocks>
+    | <block> ', ' <blocks> ;
+<block> ::= '{"fecs": ' <fecs> ', "forks": ' <forks> '}' ;
+<forks> ::= '[]'
     | '[]'
-    | '[' <node> ']'
-    | '[' <node> ']'
-    | '[' <node> ']'
-    | '[' <node> ', ' <node> ']'
-    | '[' <node> ', ' <node> ']'
-    | '[' <node> ', ' <node> ', ' <node> ']' ;
-<node> ::= '{"fecs": ' <fecs> ', "children": ' <children> '}' ;
+    | '[]'
+    | '[' <fork> ']'
+    | '[' <fork> ']'
+    | '[' <fork> ', ' <fork> ']'
+    | '[' <fork> ', ' <fork> ', ' <fork> ']'
+    | '[' <fork> ', ' <fork> ', ' <fork> ', ' <fork> ']' ;
+<fork> ::= '{"fecs": ' <fecs> '}' ;
 <fecs> ::= '1' | '2' | '3' | '4' ;
