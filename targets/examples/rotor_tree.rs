@@ -37,9 +37,14 @@
 //! open tip    TURBINE + SEND… (+ LAST)
 //! fork        TURBINE + SEND… (+ LAST)
 //! repairable  + REPAIR, anywhere among them
+//! any         + PART k, after TURBINE and before the rest of FEC set k
 //! ```
 //!
-//! `TURBINE` is the block's first shred, with the header naming its parent. `SEND` completes a
+//! `TURBINE` is the block's first shred, with the header naming its parent. `PART` sends half of a
+//! FEC set's data shreds, too few to recover it, so the set stays in progress in the shred tile's
+//! FEC resolver, which spills its oldest in-progress set once too many are. One in
+//! [`PART_ONE_IN`] FEC sets of a block gets one, after the block's `TURBINE` and before the `SEND`
+//! or `LAST` that completes the set, if any. `SEND` completes a
 //! FEC set and `LAST` the last one, which gives the slot's eager blk its dmr. `FINAL` is a
 //! finalization certificate naming the block by id. It comes only once the block and every
 //! block above it is delivered in full or repairable, as one that came earlier would have rotor
@@ -144,6 +149,9 @@ const SKIPPED_FORKS: [(usize, u32); 6] = [(0, 3), (1, 2), (2, 1), (3, 1), (4, 1)
 /// The most FEC sets a block has, as the grammar's `<fecs>`.
 const FECS_MAX: u32 = 4;
 
+/// One in this many FEC sets of a block gets a `PART`.
+const PART_ONE_IN: u32 = 3;
+
 /// The first shred of a block arrives from turbine.
 const TURBINE: &str = "TURBINE";
 /// A FEC set of a block completes.
@@ -156,6 +164,8 @@ const FINAL: &str = "FINAL";
 const SKIPPED: &str = "SKIPPED";
 /// The mock starts serving repair for a repairable block.
 const REPAIR: &str = "REPAIR";
+/// Half of a FEC set's data shreds arrive from turbine.
+const PART: &str = "PART";
 
 /// A block: the lineage blocks first, block `b` building on block `b - 1` and the first on the
 /// genesis root, then the forks.
@@ -179,6 +189,8 @@ struct Block {
     certified: bool,
     /// The mock answers repair requests for it.
     repairable: bool,
+    /// Which of its FEC sets get a `PART`.
+    parts: Vec<bool>,
 }
 
 /// Block `b`'s label, or the genesis root's for `None`.
@@ -249,6 +261,7 @@ fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rn
             finalized,
             certified,
             repairable,
+            parts: Vec::new(),
         });
     }
     // Add to `forks` a fork of `fecs` FEC sets in `slot`, at or before lineage block `b`'s,
@@ -272,6 +285,7 @@ fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rn
             finalized: false,
             certified: false,
             repairable,
+            parts: Vec::new(),
         });
     };
     // In slot order, so a fork can build on any fork before it.
@@ -340,6 +354,7 @@ fn actions(blocks: &[Block]) -> Vec<Action> {
         if block.repairable {
             actions.push(on(REPAIR, None, 0));
         }
+        actions.extend((0..block.fecs).filter(|&fec| block.parts[fec as usize]).map(|fec| on(PART, Some(fec), 0)));
     }
     let mut after = 0;
     for block in blocks.iter().filter(|block| block.finalized) {
@@ -355,8 +370,10 @@ struct Run<'a> {
     /// How many lineage blocks there are, the first of `blocks`.
     lineage_len: usize,
     slot_max: usize,
-    /// How many shreds of each block have been taken.
+    /// How many shreds of each block have been taken, `PART`s aside.
     taken: Vec<usize>,
+    /// Which `PART`s of each block have been taken, by FEC set.
+    parted: Vec<Vec<bool>>,
     lasts: Vec<bool>,
     /// How many lineage blocks from the first rotor has delivered in full: those with their
     /// `LAST` taken, up to the first without.
@@ -373,6 +390,7 @@ impl<'a> Run<'a> {
             lineage_len: blocks.iter().filter(|block| block.version == 0).count(),
             slot_max,
             taken: vec![0; blocks.len()],
+            parted: blocks.iter().map(|block| vec![false; block.fecs as usize]).collect(),
             lasts: vec![false; blocks.len()],
             delivered: 0,
             finalized: None,
@@ -404,7 +422,9 @@ impl<'a> Run<'a> {
             FINAL => (0..=b).all(|i| self.lasts[i] || self.blocks[i].repairable),
             REPAIR => true,
             _ if waits => false,
-            _ => self.taken[b] == a.step,
+            PART => self.taken[b] >= 1,
+            /* the rest of a FEC set waits for its PART */
+            _ => self.taken[b] == a.step && a.fec.is_none_or(|k| !self.blocks[b].parts[k as usize] || self.parted[b][k as usize]),
         }
     }
 
@@ -414,6 +434,7 @@ impl<'a> Run<'a> {
             match a.kind {
                 FINAL => self.finalized = self.finalized.max(Some(b)),
                 REPAIR => {}
+                PART => self.parted[b][a.fec.expect("a PART names its FEC set") as usize] = true,
                 kind => {
                     self.taken[b] += 1;
                     if kind == LAST {
@@ -540,10 +561,12 @@ fn main() -> Result<(), Error> {
     anyhow::ensure!(args.slot_max >= 2, "a window needs at least 2 slots");
     let mut rng = stream(args.seed, 0);
     // Keep the generated lineages stable for a seed while choosing slots and fates, which blocks
-    // are repairable, the forks' parents and fates, and how the actions are shuffled.
+    // are repairable, the forks' parents and fates, which FEC sets get a PART, and how the actions
+    // are shuffled.
     let mut fate_rng = stream(args.seed, 0x6661_7465_0000_0000);
     let mut repair_rng = stream(args.seed, 0x7265_7061_6972_0000);
     let mut fork_rng = stream(args.seed, 0x666f_726b_0000_0000);
+    let mut part_rng = stream(args.seed, 0x7061_7274_0000_0000);
     let mut shuffle_rng = stream(args.seed, 0x7368_7566_666c_6500);
     let mut generators = tuple_list!(DepthLimiter::new(STRUCTURE.inner(), args.depth));
 
@@ -573,7 +596,10 @@ fn main() -> Result<(), Error> {
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
-        let blocks = plan(&counts, args.slot_max, &mut fate_rng, &mut repair_rng, &mut fork_rng);
+        let mut blocks = plan(&counts, args.slot_max, &mut fate_rng, &mut repair_rng, &mut fork_rng);
+        for block in &mut blocks {
+            block.parts = (0..block.fecs).map(|_| part_rng.random_ratio(1, PART_ONE_IN)).collect();
+        }
         let mut actions = actions(&blocks);
         actions.shuffle(&mut shuffle_rng);
         let mut run = Run::new(&blocks, args.slot_max);
