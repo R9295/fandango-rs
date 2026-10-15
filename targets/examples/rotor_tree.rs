@@ -11,13 +11,16 @@
 //! A slot holds at most five blocks: its lineage block and up to four forks, other versions of
 //! the slot the leader equivocated, or in a skipped slot up to five forks, as many as
 //! [`SKIPPED_FORKS`] picks. A fork builds on the last lineage block before its slot half the
-//! time and on any lineage block before its slot otherwise. It is never finalized, has no
-//! children, and either completes or has turbine stop partway. Blocks are labelled by slot then
+//! time and otherwise on any block before its slot, lineage block or fork, so a fork can have
+//! forks after it. It is never finalized and either completes or has turbine stop partway. Blocks are labelled by slot then
 //! version as in `consensus_tree`: `a` for the lineage block, `b` on for the forks, also in a
 //! skipped slot.
 //!
-//! Every block reaches rotor through turbine. At most one version of a slot is repairable: the
-//! mock answers rotor's repair requests for it, and for no other block. A fork is never the one,
+//! Every block reaches rotor through turbine. At most one version of a slot is repairable: from
+//! its `REPAIR` action on, which may come at any point, the mock answers rotor's repair requests
+//! for it. It refuses every request before then, and every request for any other block. Rotor
+//! asks again until a block completes, so a repairable block is still delivered in full when
+//! its `REPAIR` comes late, as long as rotor asks for it. A fork is never the one,
 //! as a positional repair request names no version: the mock would answer it with the fork's
 //! shreds, which conflict with the lineage block. In a slot with forks, rotor fills the lineage
 //! block through turbine only if it has every FEC set before any fork's shred arrives, as a
@@ -33,6 +36,7 @@
 //! implied     TURBINE + SEND… + LAST          finalized only through a later block's FINAL
 //! open tip    TURBINE + SEND… (+ LAST)
 //! fork        TURBINE + SEND… (+ LAST)
+//! repairable  + REPAIR, anywhere among them
 //! ```
 //!
 //! `TURBINE` is the block's first shred, with the header naming its parent. `SEND` completes a
@@ -44,8 +48,9 @@
 //!
 //! Every skipped slot before a finalized block is `SKIPPED` once a block after it is finalized.
 //!
-//! These are the only actions: shreds and certificates, what the node is sent. The node roots
-//! on its own, every block it finalizes once it holds it in full.
+//! These are the only actions: shreds and certificates, what the node is sent, and `REPAIR`,
+//! which only changes what the mock answers. The node roots on its own, every block it finalizes
+//! once it holds it in full.
 //!
 //! The actions are shuffled. Each then waits until the tiles could send it: in its block's
 //! order, once the blocks and certificates it needs came, and inside the window of
@@ -149,6 +154,8 @@ const LAST: &str = "LAST";
 const FINAL: &str = "FINAL";
 /// A finalized block after a slot declares it skipped.
 const SKIPPED: &str = "SKIPPED";
+/// The mock starts serving repair for a repairable block.
+const REPAIR: &str = "REPAIR";
 
 /// A block: the lineage blocks first, block `b` building on block `b - 1` and the first on the
 /// genesis root, then the forks.
@@ -244,12 +251,16 @@ fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rn
             repairable,
         });
     }
-    // A fork of `fecs` FEC sets in `slot`, at or before lineage block `b`'s, repairable if
-    // `repairable`.
-    let fork = |rng: &mut StdRng, slot: usize, b: usize, version: u8, fecs: u32, lineage: Option<usize>, repairable: bool| {
-        let parent = if b == 0 || rng.random_bool(0.5) { b.checked_sub(1) } else { Some(rng.random_range(0..b)) };
+    // Add to `forks` a fork of `fecs` FEC sets in `slot`, at or before lineage block `b`'s,
+    // repairable if `repairable`. It builds on lineage block `b - 1` half the time, else on any
+    // block before `slot`: a lineage block before `b` or a fork in `forks`.
+    let lineage_len = counts.len();
+    let fork = |rng: &mut StdRng, forks: &mut Vec<Block>, slot: usize, b: usize, version: u8, fecs: u32, lineage: Option<usize>, repairable: bool| {
+        let earlier: Vec<usize> =
+            (0..b).chain(forks.iter().enumerate().filter(|(_, f)| f.slot < slot).map(|(i, _)| lineage_len + i)).collect();
+        let parent = if earlier.is_empty() || rng.random_bool(0.5) { b.checked_sub(1) } else { Some(earlier[rng.random_range(0..earlier.len())]) };
         let last = rng.random_bool(0.5);
-        Block {
+        forks.push(Block {
             slot,
             version,
             parent,
@@ -261,24 +272,23 @@ fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rn
             finalized: false,
             certified: false,
             repairable,
-        }
+        });
     };
+    // In slot order, so a fork can build on any fork before it.
     let mut forks_of = Vec::new();
-    for (b, (_, forks)) in counts.iter().enumerate() {
-        for (version, &fecs) in (1..).zip(forks) {
-            forks_of.push(fork(fork_rng, slots[b], b, version, fecs, Some(b), false));
-        }
-    }
     let weight_total: u32 = SKIPPED_FORKS.iter().map(|&(_, weight)| weight).sum();
-    for b in 0..counts.len() {
+    for (b, (_, forks)) in counts.iter().enumerate() {
         for slot in b.checked_sub(1).map_or(0, |prev| slots[prev]) + 1..slots[b] {
             let mut pick = repair_rng.random_range(0..weight_total);
             let count = SKIPPED_FORKS.iter().find(|&&(_, weight)| pick < weight || { pick -= weight; false }).map_or(0, |&(count, _)| count);
             let repairable = (count > 0 && repair_rng.random_ratio(1, REPAIR_ONE_IN)).then(|| repair_rng.random_range(0..count));
             for (i, version) in (1..).take(count).enumerate() {
                 let fecs = fork_rng.random_range(1..=FECS_MAX);
-                forks_of.push(fork(fork_rng, slot, b, version, fecs, None, repairable == Some(i)));
+                fork(fork_rng, &mut forks_of, slot, b, version, fecs, None, repairable == Some(i));
             }
+        }
+        for (version, &fecs) in (1..).zip(forks) {
+            fork(fork_rng, &mut forks_of, slots[b], b, version, fecs, Some(b), false);
         }
     }
     blocks.extend(forks_of);
@@ -313,8 +323,8 @@ impl Action {
     }
 }
 
-/// Every action of the lineage: each block's shreds and certificate, and a `SKIPPED` for every
-/// skipped slot before a finalized block.
+/// Every action of the lineage: each block's shreds and certificate, a `REPAIR` for each
+/// repairable block, and a `SKIPPED` for every skipped slot before a finalized block.
 fn actions(blocks: &[Block]) -> Vec<Action> {
     let mut actions = Vec::new();
     for (b, block) in blocks.iter().enumerate() {
@@ -326,6 +336,9 @@ fn actions(blocks: &[Block]) -> Vec<Action> {
         }
         if block.certified {
             actions.push(on(FINAL, None, 0));
+        }
+        if block.repairable {
+            actions.push(on(REPAIR, None, 0));
         }
     }
     let mut after = 0;
@@ -389,6 +402,7 @@ impl<'a> Run<'a> {
         };
         match a.kind {
             FINAL => (0..=b).all(|i| self.lasts[i] || self.blocks[i].repairable),
+            REPAIR => true,
             _ if waits => false,
             _ => self.taken[b] == a.step,
         }
@@ -399,6 +413,7 @@ impl<'a> Run<'a> {
         if let Some(b) = a.block {
             match a.kind {
                 FINAL => self.finalized = self.finalized.max(Some(b)),
+                REPAIR => {}
                 kind => {
                     self.taken[b] += 1;
                     if kind == LAST {
@@ -446,8 +461,26 @@ impl<'a> Run<'a> {
         out.push('\n');
     }
 
-    /// Draw the lineage as a tree, a block or skipped slot per line. Under each block come its
-    /// forks, in slot order, and then the lineage goes on, through the skipped slots before its
+    /// Draw fork `f` after `prefix`, the last of its siblings if `last`, and the forks on it under
+    /// it.
+    fn subtree(&self, out: &mut String, prefix: &str, f: usize, last: bool) {
+        self.line(out, prefix, f, last, false);
+        let children = self.forks_on(Some(f));
+        let prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
+        for (i, &c) in children.iter().enumerate() {
+            self.subtree(out, &prefix, c, i + 1 == children.len());
+        }
+    }
+
+    /// The forks that build on block `b`, or on the genesis root for `None`, in slot order.
+    fn forks_on(&self, b: Option<usize>) -> Vec<usize> {
+        let mut forks: Vec<usize> = (self.lineage_len..self.blocks.len()).filter(|&f| self.blocks[f].parent == b).collect();
+        forks.sort_by_key(|&f| (self.blocks[f].slot, self.blocks[f].version));
+        forks
+    }
+
+    /// Draw the lineage as a tree, a block or skipped slot per line. Under each block come the
+    /// forks on it, in slot order, each with the forks on it, and then the lineage goes on, through the skipped slots before its
     /// next block, each under the one before it as `consensus_tree` draws. A block under a
     /// skipped slot names its parent.
     fn draw(&self) -> String {
@@ -458,10 +491,9 @@ impl<'a> Run<'a> {
         let mut node = None;
         loop {
             let next = node.map_or(0, |b| b + 1);
-            let mut forks: Vec<usize> = (self.lineage_len..self.blocks.len()).filter(|&f| self.blocks[f].parent == node).collect();
-            forks.sort_by_key(|&f| (self.blocks[f].slot, self.blocks[f].version));
+            let forks = self.forks_on(node);
             for (i, &f) in forks.iter().enumerate() {
-                self.line(&mut out, &prefix, f, i + 1 == forks.len() && next == self.lineage_len, false);
+                self.subtree(&mut out, &prefix, f, i + 1 == forks.len() && next == self.lineage_len);
             }
             if next == self.lineage_len {
                 return out;
