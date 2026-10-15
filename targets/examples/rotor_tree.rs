@@ -44,7 +44,9 @@
 //! FEC set's data shreds, too few to recover it, so the set stays in progress in the shred tile's
 //! FEC resolver, which spills its oldest in-progress set once too many are. One in
 //! [`PART_ONE_IN`] FEC sets of a block gets one, after the block's `TURBINE` and before the `SEND`
-//! or `LAST` that completes the set, if any. `SEND` completes a
+//! or `LAST` that completes the set, if any. One in [`CODE_ONE_IN`] `SEND`s and `LAST`s sends the
+//! set's coding shreds instead of the data shreds it still lacks (`"code": true`), so the shred
+//! tile recovers the data shreds by erasure coding. `SEND` completes a
 //! FEC set and `LAST` the last one, which gives the slot's eager blk its dmr. `FINAL` is a
 //! finalization certificate naming the block by id. It comes only once the block and every
 //! block above it is delivered in full or repairable, as one that came earlier would have rotor
@@ -152,6 +154,9 @@ const FECS_MAX: u32 = 4;
 /// One in this many FEC sets of a block gets a `PART`.
 const PART_ONE_IN: u32 = 3;
 
+/// One in this many `SEND`s and `LAST`s completes its FEC sets from coding shreds.
+const CODE_ONE_IN: u32 = 3;
+
 /// The first shred of a block arrives from turbine.
 const TURBINE: &str = "TURBINE";
 /// A FEC set of a block completes.
@@ -191,6 +196,8 @@ struct Block {
     repairable: bool,
     /// Which of its FEC sets get a `PART`.
     parts: Vec<bool>,
+    /// Which of its FEC sets turbine completes from coding shreds, by the `SEND` or `LAST` on it.
+    coded: Vec<bool>,
 }
 
 /// Block `b`'s label, or the genesis root's for `None`.
@@ -262,6 +269,7 @@ fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rn
             certified,
             repairable,
             parts: Vec::new(),
+            coded: Vec::new(),
         });
     }
     // Add to `forks` a fork of `fecs` FEC sets in `slot`, at or before lineage block `b`'s,
@@ -286,6 +294,7 @@ fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rn
             certified: false,
             repairable,
             parts: Vec::new(),
+            coded: Vec::new(),
         });
     };
     // In slot order, so a fork can build on any fork before it.
@@ -319,6 +328,8 @@ struct Action {
     fec: Option<u32>,
     /// How many of its block's shreds come before it.
     step: usize,
+    /// A `SEND` or `LAST` that sends coding shreds instead of the data shreds its sets lack.
+    code: bool,
 }
 
 impl Action {
@@ -332,6 +343,9 @@ impl Action {
         if let Some(fec) = self.fec {
             let _ = write!(out, ", \"fec\": {fec}");
         }
+        if self.code {
+            out.push_str(", \"code\": true");
+        }
         out.push('}');
         out
     }
@@ -342,7 +356,10 @@ impl Action {
 fn actions(blocks: &[Block]) -> Vec<Action> {
     let mut actions = Vec::new();
     for (b, block) in blocks.iter().enumerate() {
-        let on = |kind, fec, step| Action { kind, block: Some(b), slot: block.slot, fec, step };
+        let on = |kind, fec: Option<u32>, step| {
+            let code = (kind == SEND || kind == LAST) && fec.is_some_and(|k| block.coded[k as usize]);
+            Action { kind, block: Some(b), slot: block.slot, fec, step, code }
+        };
         actions.push(on(TURBINE, None, 0));
         actions.extend((0..block.sends).map(|fec| on(SEND, Some(fec), fec as usize + 1)));
         if block.last {
@@ -358,7 +375,7 @@ fn actions(blocks: &[Block]) -> Vec<Action> {
     }
     let mut after = 0;
     for block in blocks.iter().filter(|block| block.finalized) {
-        actions.extend((after + 1..block.slot).map(|slot| Action { kind: SKIPPED, block: None, slot, fec: None, step: 0 }));
+        actions.extend((after + 1..block.slot).map(|slot| Action { kind: SKIPPED, block: None, slot, fec: None, step: 0, code: false }));
         after = block.slot;
     }
     actions
@@ -561,12 +578,13 @@ fn main() -> Result<(), Error> {
     anyhow::ensure!(args.slot_max >= 2, "a window needs at least 2 slots");
     let mut rng = stream(args.seed, 0);
     // Keep the generated lineages stable for a seed while choosing slots and fates, which blocks
-    // are repairable, the forks' parents and fates, which FEC sets get a PART, and how the actions
-    // are shuffled.
+    // are repairable, the forks' parents and fates, which FEC sets get a PART, which arrive as
+    // coding shreds, and how the actions are shuffled.
     let mut fate_rng = stream(args.seed, 0x6661_7465_0000_0000);
     let mut repair_rng = stream(args.seed, 0x7265_7061_6972_0000);
     let mut fork_rng = stream(args.seed, 0x666f_726b_0000_0000);
     let mut part_rng = stream(args.seed, 0x7061_7274_0000_0000);
+    let mut code_rng = stream(args.seed, 0x636f_6465_0000_0000);
     let mut shuffle_rng = stream(args.seed, 0x7368_7566_666c_6500);
     let mut generators = tuple_list!(DepthLimiter::new(STRUCTURE.inner(), args.depth));
 
@@ -599,6 +617,7 @@ fn main() -> Result<(), Error> {
         let mut blocks = plan(&counts, args.slot_max, &mut fate_rng, &mut repair_rng, &mut fork_rng);
         for block in &mut blocks {
             block.parts = (0..block.fecs).map(|_| part_rng.random_ratio(1, PART_ONE_IN)).collect();
+            block.coded = (0..block.fecs).map(|_| code_rng.random_ratio(1, CODE_ONE_IN)).collect();
         }
         let mut actions = actions(&blocks);
         actions.shuffle(&mut shuffle_rng);
