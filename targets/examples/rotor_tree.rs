@@ -22,12 +22,14 @@
 //! asks again until a block completes, so a repairable block is still delivered in full when
 //! its `REPAIR` comes late, as long as rotor asks for it. A fork is never the one,
 //! as a positional repair request names no version: the mock would answer it with the fork's
-//! shreds, which conflict with the lineage block. In a slot with forks, rotor fills the lineage
-//! block through turbine only if it has every FEC set before any fork's shred arrives, as a
-//! conflicting shred invalidates the slot. So there the lineage block is repairable, always if
-//! turbine never completes it, and one in [`REPAIR_ONE_IN`] times otherwise, when the forks'
-//! shreds wait for its `LAST`. Without forks, one in [`REPAIR_ONE_IN`] lineage blocks is
-//! repairable. A skipped slot has no lineage block for its forks to conflict with, so one in
+//! shreds, which conflict with the lineage block. Every finalized lineage block is repairable:
+//! turbine alone does not guarantee a block, as the shred tile's FEC resolver may spill a partly
+//! received FEC set, which only repair recovers, and the mock sends each turbine shred once. The
+//! open tip is repairable one in [`REPAIR_ONE_IN`] times, and always in a slot with forks if
+//! turbine never completes it. In a slot with forks, rotor fills the lineage block through turbine
+//! only if it has every FEC set before any fork's shred arrives, as a conflicting shred
+//! invalidates the slot, so the forks' shreds wait for a lineage block that is not repairable to
+//! get its `LAST`. A skipped slot has no lineage block for its forks to conflict with, so one in
 //! [`REPAIR_ONE_IN`] skipped slots with forks has one of them repairable, and their shreds wait for
 //! nothing.
 //!
@@ -72,8 +74,9 @@
 //!
 //! Each lineage is written as JSON. `blocks` lists each node in slot order with its parent, its
 //! number of FEC sets, as `repair` whether it is repairable, and as `replay` whether the node
-//! replays it: `yes` if turbine or repair always delivers it in full, `no` if neither can, and
-//! `maybe` if that depends on the order rotor sees its slot's versions in, as for every fork.
+//! replays it: `yes` if repair always delivers it in full, `no` if neither turbine nor repair
+//! can, and `maybe` if that depends on the order rotor sees its slot's versions in, as for every
+//! fork, or on whether the FEC resolver spills a set turbine sends once.
 //! `actions` names each action's node and parent, or for `SKIPPED` its slot. A `SEND` or `LAST`
 //! also names its FEC set as `fec`. With `-o`, each lineage is also written to
 //! `<OUT_DIR>/<ITERATION>.json` on one line.
@@ -141,7 +144,8 @@ const OPEN_TIP_ONE_IN: u32 = 3;
 /// gets no finalization certificate of its own.
 const IMPLIED_ONE_IN: u32 = 4;
 
-/// One in this many lineage blocks is repairable, unless its slot needs it to be.
+/// One in this many open tips is repairable, unless its slot needs it to be. Every finalized
+/// lineage block is.
 const REPAIR_ONE_IN: u32 = 2;
 
 /// How many forks a skipped slot holds, each with its weight out of their sum: none a third of the
@@ -216,11 +220,12 @@ fn replay(blocks: &[Block], b: usize) -> &'static str {
     if block.version > 0 {
         return "maybe"; /* rotor may take it, or splice it, as the slot's eager blk */
     }
-    match (block.finalized, block.forked, block.last || block.repairable) {
+    match (block.finalized, block.forked, block.repairable, block.last) {
         (true, ..) => "yes",
-        (false, true, _) if block.repairable => "maybe", /* repair may fill another version's eager blk */
-        (false, _, true) => "yes",
-        (false, _, false) => "no",
+        (false, true, true, _) => "maybe", /* repair may fill another version's eager blk */
+        (false, false, true, _) => "yes",
+        (false, _, false, true) => "maybe", /* the FEC resolver may spill a set turbine sent once */
+        (false, _, false, false) => "no",
     }
 }
 
@@ -255,7 +260,7 @@ fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rn
         if certified {
             certified_slot = slots[b];
         }
-        let repairable = repair_rng.random_ratio(1, REPAIR_ONE_IN) || (forked && !last);
+        let repairable = repair_rng.random_ratio(1, REPAIR_ONE_IN) || finalized || (forked && !last);
         blocks.push(Block {
             slot: slots[b],
             version: 0,
