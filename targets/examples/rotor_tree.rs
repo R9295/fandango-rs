@@ -34,8 +34,8 @@
 //! nothing.
 //!
 //! ```text
-//! finalized   TURBINE + SEND… + LAST + FINAL
-//! implied     TURBINE + SEND… + LAST          finalized only through a later block's FINAL
+//! finalized   TURBINE + SEND… + LAST + NOTAR + FINAL
+//! implied     TURBINE + SEND… + LAST + NOTAR  finalized only through a later block's FINAL
 //! open tip    TURBINE + SEND… (+ LAST)
 //! fork        TURBINE + SEND… (+ LAST)
 //! repairable  + REPAIR, anywhere among them
@@ -53,7 +53,9 @@
 //! finalization certificate naming the block by id. It comes only once the block and every
 //! block above it is delivered in full or repairable, as one that came earlier would have rotor
 //! create a blk by id for a block, which only repair fills. One in [`IMPLIED_ONE_IN`] finalized
-//! blocks, other than the last and those the window needs, has no `FINAL` of its own.
+//! blocks, other than the last and those the window needs, has no `FINAL` of its own. `NOTAR` is
+//! a notarization certificate naming the block by id, which every finalized block gets, under the
+//! same condition as `FINAL`.
 //!
 //! Every skipped slot before a finalized block is `SKIPPED` once a block after it is finalized.
 //!
@@ -68,15 +70,18 @@
 //! own.
 //!
 //! The lineage is drawn as a tree, each block under its parent as `consensus_tree` draws it, a
-//! block's forks before the lineage goes on. Each block shows `TURBINE` if turbine delivered it
-//! and `REPAIR` if it is repairable, and each `SKIPPED` slot is drawn in slot order with
+//! block's forks before the lineage goes on. Each block shows `TURBINE` if turbine delivered it,
+//! `REPAIR` if it is repairable and `DEAD` if it is dead, and each `SKIPPED` slot is drawn in slot order with
 //! `SKIPPED`. A block under a skipped slot names its parent.
 //!
 //! Each lineage is written as JSON. `blocks` lists each node in slot order with its parent, its
 //! number of FEC sets, as `repair` whether it is repairable, and as `replay` whether the node
 //! replays it: `yes` if repair always delivers it in full, `no` if neither turbine nor repair
 //! can, and `maybe` if that depends on the order rotor sees its slot's versions in, as for every
-//! fork, or on whether the FEC resolver spills a set turbine sends once.
+//! fork, or on whether the FEC resolver spills a set turbine sends once, and `dead` whether its
+//! footer declares a wrong bank hash. One in [`DEAD_ONE_IN`] blocks the cluster does not finalize
+//! is dead: replay marks it dead once it has it in full, and drops what builds on it from then
+//! on, so a block under a dead one is at best `maybe`.
 //! `actions` names each action's node and parent, or for `SKIPPED` its slot. A `SEND` or `LAST`
 //! also names its FEC set as `fec`. With `-o`, each lineage is also written to
 //! `<OUT_DIR>/<ITERATION>.json` on one line.
@@ -152,6 +157,10 @@ const REPAIR_ONE_IN: u32 = 2;
 /// time, as the grammar gives a lineage block's slot.
 const SKIPPED_FORKS: [(usize, u32); 6] = [(0, 3), (1, 2), (2, 1), (3, 1), (4, 1), (5, 1)];
 
+/// One in this many blocks the cluster does not finalize, the forks and an open tip, is dead: its
+/// footer declares a bank hash its execution does not reach, so replay marks it dead.
+const DEAD_ONE_IN: u32 = 4;
+
 /// The most FEC sets a block has, as the grammar's `<fecs>`.
 const FECS_MAX: u32 = 4;
 
@@ -169,6 +178,8 @@ const SEND: &str = "SEND";
 const LAST: &str = "LAST";
 /// A finalization certificate names a block.
 const FINAL: &str = "FINAL";
+/// A notarization certificate names a block.
+const NOTAR: &str = "NOTAR";
 /// A finalized block after a slot declares it skipped.
 const SKIPPED: &str = "SKIPPED";
 /// The mock starts serving repair for a repairable block.
@@ -202,6 +213,8 @@ struct Block {
     parts: Vec<bool>,
     /// Which of its FEC sets turbine completes from coding shreds, by the `SEND` or `LAST` on it.
     coded: Vec<bool>,
+    /// Its footer declares a wrong bank hash, so replay marks it dead. Never a finalized block.
+    dead: bool,
 }
 
 /// Block `b`'s label, or the genesis root's for `None`.
@@ -214,8 +227,23 @@ fn parent(blocks: &[Block], b: usize) -> String {
     label(blocks, blocks[b].parent)
 }
 
-/// Whether the node replays block `b`: `yes`, `no`, or `maybe`.
+/// Whether the node replays block `b`: `yes`, `no`, or `maybe`. A dead block is replayed, and
+/// only then marked dead: replay drops what builds on it once it is, but may take a descendant
+/// in full before.
 fn replay(blocks: &[Block], b: usize) -> &'static str {
+    let full = replay_alive(blocks, b);
+    let mut above = blocks[b].parent;
+    while let Some(a) = above {
+        if blocks[a].dead {
+            return if full == "no" { "no" } else { "maybe" };
+        }
+        above = blocks[a].parent;
+    }
+    full
+}
+
+/// Whether the node replays block `b` were no block above it dead.
+fn replay_alive(blocks: &[Block], b: usize) -> &'static str {
     let block = &blocks[b];
     if block.version > 0 {
         return "maybe"; /* rotor may take it, or splice it, as the slot's eager blk */
@@ -275,6 +303,7 @@ fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rn
             repairable,
             parts: Vec::new(),
             coded: Vec::new(),
+            dead: false,
         });
     }
     // Add to `forks` a fork of `fecs` FEC sets in `slot`, at or before lineage block `b`'s,
@@ -300,6 +329,7 @@ fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rn
             repairable,
             parts: Vec::new(),
             coded: Vec::new(),
+            dead: false,
         });
     };
     // In slot order, so a fork can build on any fork before it.
@@ -356,7 +386,7 @@ impl Action {
     }
 }
 
-/// Every action of the lineage: each block's shreds and certificate, a `REPAIR` for each
+/// Every action of the lineage: each block's shreds and certificates, a `REPAIR` for each
 /// repairable block, and a `SKIPPED` for every skipped slot before a finalized block.
 fn actions(blocks: &[Block]) -> Vec<Action> {
     let mut actions = Vec::new();
@@ -372,6 +402,9 @@ fn actions(blocks: &[Block]) -> Vec<Action> {
         }
         if block.certified {
             actions.push(on(FINAL, None, 0));
+        }
+        if block.finalized {
+            actions.push(on(NOTAR, None, 0));
         }
         if block.repairable {
             actions.push(on(REPAIR, None, 0));
@@ -441,7 +474,7 @@ impl<'a> Run<'a> {
             _ => false,
         };
         match a.kind {
-            FINAL => (0..=b).all(|i| self.lasts[i] || self.blocks[i].repairable),
+            FINAL | NOTAR => (0..=b).all(|i| self.lasts[i] || self.blocks[i].repairable),
             REPAIR => true,
             _ if waits => false,
             PART => self.taken[b] >= 1,
@@ -455,7 +488,7 @@ impl<'a> Run<'a> {
         if let Some(b) = a.block {
             match a.kind {
                 FINAL => self.finalized = self.finalized.max(Some(b)),
-                REPAIR => {}
+                NOTAR | REPAIR => {}
                 PART => self.parted[b][a.fec.expect("a PART names its FEC set") as usize] = true,
                 kind => {
                     self.taken[b] += 1;
@@ -497,6 +530,9 @@ impl<'a> Run<'a> {
         }
         if self.blocks[b].repairable {
             out.push_str("  REPAIR");
+        }
+        if self.blocks[b].dead {
+            out.push_str("  DEAD");
         }
         if under_skip {
             let _ = write!(out, "  (parent {})", parent(self.blocks, b));
@@ -565,7 +601,10 @@ fn blocks_json(blocks: &[Block]) -> Vec<String> {
         .map(|b| {
             let (node, parent, block) = (label(blocks, Some(b)), parent(blocks, b), &blocks[b]);
             let replay = replay(blocks, b);
-            format!("{{\"node\": \"{node}\", \"parent\": \"{parent}\", \"fecs\": {}, \"repair\": {}, \"replay\": \"{replay}\"}}", block.fecs, block.repairable)
+            format!(
+                "{{\"node\": \"{node}\", \"parent\": \"{parent}\", \"fecs\": {}, \"repair\": {}, \"replay\": \"{replay}\", \"dead\": {}}}",
+                block.fecs, block.repairable, block.dead
+            )
         })
         .collect()
 }
@@ -590,6 +629,7 @@ fn main() -> Result<(), Error> {
     let mut fork_rng = stream(args.seed, 0x666f_726b_0000_0000);
     let mut part_rng = stream(args.seed, 0x7061_7274_0000_0000);
     let mut code_rng = stream(args.seed, 0x636f_6465_0000_0000);
+    let mut dead_rng = stream(args.seed, 0x6465_6164_0000_0000);
     let mut shuffle_rng = stream(args.seed, 0x7368_7566_666c_6500);
     let mut generators = tuple_list!(DepthLimiter::new(STRUCTURE.inner(), args.depth));
 
@@ -623,6 +663,7 @@ fn main() -> Result<(), Error> {
         for block in &mut blocks {
             block.parts = (0..block.fecs).map(|_| part_rng.random_ratio(1, PART_ONE_IN)).collect();
             block.coded = (0..block.fecs).map(|_| code_rng.random_ratio(1, CODE_ONE_IN)).collect();
+            block.dead = !block.finalized && dead_rng.random_ratio(1, DEAD_ONE_IN);
         }
         let mut actions = actions(&blocks);
         actions.shuffle(&mut shuffle_rng);
