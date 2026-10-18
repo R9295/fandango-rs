@@ -16,6 +16,7 @@ scriptsizec = []
 xml = []
 yul = []
 clang = []
+javascript = ["static_defs", "dep:tree-sitter", "dep:tree-sitter-javascript"]
 
 static_defs = []
 
@@ -33,6 +34,8 @@ embedded-io.workspace = true
 hashbrown.workspace = true
 num-rational.workspace = true
 mappable-rc.workspace = true
+tree-sitter = { version = "0.27.1", optional = true }
+tree-sitter-javascript = { version = "0.25.0", optional = true }
 
 [lints]
 workspace = true
@@ -66,3 +69,8 @@ required-features = ["evm", "static_defs"]
 name = "yul_kpath"
 path = "examples/yul_kpath.rs"
 required-features = ["yul", "static_defs"]
+
+[[example]]
+name = "js_lang"
+path = "examples/js_lang.rs"
+required-features = ["javascript"]

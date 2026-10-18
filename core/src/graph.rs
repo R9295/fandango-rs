@@ -628,9 +628,12 @@ pub fn shortest_path<'program, 'source>(
         .node_references()
         .filter_map(|(idx, node)| matches!(node, FandangoNode::String(_)).then_some((idx, 0usize)))
         .collect::<HashMap<_, _>>();
-    let mut queue = depths
-        .keys()
-        .copied()
+    // Initialization order affects which alternatives are discovered first.
+    // Follow graph order, not randomized HashMap iteration, so a seeded
+    // generator can reproduce its depth-limited choices across processes.
+    let mut queue = graph
+        .node_indices()
+        .filter(|idx| depths.contains_key(idx))
         .flat_map(|term| graph.edges_directed(term, Direction::Incoming))
         .map(|e| e.source())
         .collect::<VecDeque<_>>();

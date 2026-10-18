@@ -45,6 +45,9 @@ pub mod alpenglow;
 /// The module for c language testing.
 #[cfg(feature = "clang")]
 pub mod clang;
+/// JavaScript generation and in-process syntax validation.
+#[cfg(feature = "javascript")]
+pub mod javascript;
 #[cfg(feature = "csv")]
 pub mod csv;
 #[cfg(feature = "evm")]

@@ -66,6 +66,55 @@ To see the results and see the results to fill the table, simply execute:
 cat compiler-testing-results/c_lang_*.txt
 ```
 
+## Continuous JavaScript generation
+
+The `js_lang` example evolves ordinary JavaScript scripts with NSGA-II. It uses
+`tree-sitter` and `tree-sitter-javascript` in-process; Node.js is not required.
+
+```sh
+RUSTFLAGS="-Znext-solver" cargo run --release -p fandango-targets --features javascript --example js_lang
+```
+
+This runs until interrupted. For a reproducible, bounded run, append
+`-- --seed 42 --generations 100`, or use `-- --seconds 30`. Limits are checked
+between generations, including initial population creation in elapsed time.
+Append `-- --help` to see all settings.
+
+The grammar includes `let`/`const`, expressions, functions and calls, objects,
+arrays, conditionals, and for/for-in/for-of/while/do-while loops. It excludes
+modules, JSX, `var`, classes, async/generators, labels, and destructuring.
+Programs are never executed, saved, or sent to a target.
+
+Acceptance requires a Tree-sitter tree without error or missing nodes and no
+contextual violations: conflicting lexical bindings, missing `const`
+initializers, invalid assignment/update targets, returns outside functions, or
+break/continue outside loops in the current function. Undefined names and runtime
+type errors are allowed. These checks cover the generated subset, not all
+ECMAScript early errors. Violating candidates participate in evolution, but are
+not counted as accepted.
+
+Each validity penalty and size penalty is a separate objective. The soft size
+goals are at most two functions, at least ten statements, and at least one object
+literal, array literal, and loop. Size never gates acceptance, and reaching full
+validity does not stop evolution. Statement counts include function declarations
+and control-flow statements, but exclude blocks and for-header declarations.
+
+Defaults are 100 survivors, 100 offspring per generation, 80% crossover, and 10%
+fresh random replacements. The hook limits retained trees to 4,096 nodes,
+depth 128, and 65,536 source bytes; generation switches to shortest expansions at
+depth 24. Oversized candidates are regenerated, falling back to an empty script.
+All these settings and size goals have CLI overrides. The crossover percentage
+applies before fresh replacements. Mutation locations are random: Tree-sitter
+positions are not Fandango tree paths.
+
+Reports show evaluations/second, syntax passes, acceptance rate, accepted
+programs/second, accepted programs meeting all size goals, and mean source size.
+Every created candidate is measured once, including initial candidates and
+discarded offspring; the counters include duplicate programs. The harness retains
+the current population and aggregate counters, without an accumulating corpus or
+history. The seed printed at startup can reproduce generation when used with a
+generation limit and identical settings.
+
 ## Navigating this repository
 
 There are a number of individual software packages provided here, summarized below:
