@@ -5,7 +5,7 @@
 //! recovery parser with contextual checks for this subset. It is not a full
 //! ECMAScript early-error implementation, and does not execute programs.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -57,6 +57,34 @@ pub struct Counts {
     pub arrays: usize,
     /// For, for-in/of, while, and do-while loops.
     pub loops: usize,
+    /// References to names already bound in a visible scope.
+    pub variable_reuses: usize,
+    /// Maximum nesting of semantic expression nodes.
+    pub expression_nesting: usize,
+    /// Call expressions.
+    pub calls: usize,
+    /// Conditionals, loops, returns, breaks, and continues.
+    pub control_flow: usize,
+    /// Assignments and updates to variables, properties, or indexed values.
+    pub state_mutations: usize,
+    /// Distinct statically recognizable mixed-type operand pairs.
+    pub type_coercion_diversity: usize,
+}
+
+impl Counts {
+    /// Evolutionary rewards in reuse, nesting, call, control-flow, mutation,
+    /// mixed-type-pair order.
+    #[must_use]
+    pub fn rewards(self) -> [usize; 6] {
+        [
+            self.variable_reuses,
+            self.expression_nesting,
+            self.calls,
+            self.control_flow,
+            self.state_mutations,
+            self.type_coercion_diversity,
+        ]
+    }
 }
 
 /// Soft size goals, independent of program acceptance.
@@ -143,6 +171,8 @@ impl Validator {
             scopes: vec![BTreeMap::new()],
             enclosing_loops: Vec::new(),
             loops: 0,
+            expression_depth: 0,
+            coercion_pairs: BTreeSet::new(),
         };
         // An iterative walk handles even deeply nested rejected source without
         // consuming the Rust stack. Include anonymous children: missing tokens
@@ -179,6 +209,19 @@ struct Checker<'a> {
     scopes: Vec<BTreeMap<String, u8>>,
     enclosing_loops: Vec<usize>,
     loops: usize,
+    expression_depth: usize,
+    coercion_pairs: BTreeSet<(StaticType, StaticType)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StaticType {
+    Number,
+    String,
+    Boolean,
+    Null,
+    Object,
+    Array,
+    Undefined,
 }
 
 fn is_loop(kind: &str) -> bool {
@@ -193,6 +236,78 @@ fn is_function(kind: &str) -> bool {
         kind,
         "function_declaration" | "function_expression" | "arrow_function"
     )
+}
+
+fn is_expression(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "number"
+            | "string"
+            | "true"
+            | "false"
+            | "null"
+            | "object"
+            | "array"
+            | "binary_expression"
+            | "unary_expression"
+            | "call_expression"
+            | "member_expression"
+            | "subscript_expression"
+            | "assignment_expression"
+            | "augmented_assignment_expression"
+            | "update_expression"
+    )
+}
+
+fn is_binding_identifier(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "variable_declarator" | "function_declaration" | "function_expression"
+        ) && parent.child_by_field_name("name") == Some(node)
+            || parent.kind() == "formal_parameters"
+            || parent.kind() == "for_in_statement"
+                && parent.child_by_field_name("kind").is_some()
+                && parent.child_by_field_name("left") == Some(node)
+    })
+}
+
+fn static_type(mut node: Node<'_>, source: &str) -> Option<StaticType> {
+    while node.kind() == "parenthesized_expression" {
+        node = node.named_child(0)?;
+    }
+    match node.kind() {
+        "number" => Some(StaticType::Number),
+        "string" => Some(StaticType::String),
+        "true" | "false" => Some(StaticType::Boolean),
+        "null" => Some(StaticType::Null),
+        "object" => Some(StaticType::Object),
+        "array" => Some(StaticType::Array),
+        "unary_expression" => {
+            let operator = node.child_by_field_name("operator")?;
+            match &source[operator.byte_range()] {
+                "!" => Some(StaticType::Boolean),
+                "typeof" => Some(StaticType::String),
+                "void" => Some(StaticType::Undefined),
+                "+" | "-" | "~" => Some(StaticType::Number),
+                _ => None,
+            }
+        }
+        "binary_expression" => {
+            let operator = node.child_by_field_name("operator")?;
+            match &source[operator.byte_range()] {
+                "==" | "!=" | "===" | "!==" | "<" | "<=" | ">" | ">=" | "in" | "instanceof" => {
+                    Some(StaticType::Boolean)
+                }
+                "-" | "*" | "/" | "%" | "**" | "<<" | ">>" | ">>>" | "&" | "|" | "^" => {
+                    Some(StaticType::Number)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn is_function_body(node: Node<'_>) -> bool {
@@ -227,8 +342,77 @@ impl Checker<'_> {
         *previous |= kind;
     }
 
+    fn record_mutation_and_coercion(&mut self, node: Node<'_>) {
+        let kind = node.kind();
+        if matches!(
+            kind,
+            "assignment_expression" | "augmented_assignment_expression" | "update_expression"
+        ) {
+            let field = if kind == "update_expression" {
+                "argument"
+            } else {
+                "left"
+            };
+            self.analysis.counts.state_mutations += usize::from(
+                node.child_by_field_name(field)
+                    .is_some_and(valid_assignment_target),
+            );
+        }
+        if kind == "binary_expression"
+            && let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+            && let (Some(left), Some(right)) = (
+                static_type(left, self.source),
+                static_type(right, self.source),
+            )
+            && left != right
+        {
+            let pair = if left < right {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            if self.coercion_pairs.insert(pair) {
+                self.analysis.counts.type_coercion_diversity += 1;
+            }
+        }
+    }
+
+    fn record_rewards(&mut self, node: Node<'_>) {
+        let kind = node.kind();
+        self.record_mutation_and_coercion(node);
+        if is_expression(kind) {
+            self.expression_depth += 1;
+            self.analysis.counts.expression_nesting = self
+                .analysis
+                .counts
+                .expression_nesting
+                .max(self.expression_depth);
+        }
+        self.analysis.counts.calls += usize::from(kind == "call_expression");
+        self.analysis.counts.control_flow += usize::from(
+            is_loop(kind)
+                || matches!(
+                    kind,
+                    "if_statement" | "return_statement" | "break_statement" | "continue_statement"
+                ),
+        );
+        if kind == "identifier" && !is_binding_identifier(node) {
+            let name = &self.source[node.byte_range()];
+            self.analysis.counts.variable_reuses += usize::from(
+                self.scopes
+                    .iter()
+                    .rev()
+                    .any(|scope| scope.contains_key(name)),
+            );
+        }
+    }
+
     fn enter(&mut self, node: Node<'_>) {
         let kind = node.kind();
+        self.record_rewards(node);
         if node.is_error() || node.is_missing() {
             self.analysis.validity.syntax += 1;
         }
@@ -324,6 +508,9 @@ impl Checker<'_> {
 
     fn leave(&mut self, node: Node<'_>) {
         let kind = node.kind();
+        if is_expression(kind) {
+            self.expression_depth -= 1;
+        }
         if (kind == "statement_block" && !is_function_body(node))
             || matches!(kind, "for_statement" | "for_in_statement")
         {
@@ -442,12 +629,43 @@ mod tests {
                 statements: 5,
                 objects: 1,
                 arrays: 1,
-                loops: 1
+                loops: 1,
+                variable_reuses: 4,
+                expression_nesting: 3,
+                calls: 0,
+                control_flow: 2,
+                state_mutations: 1,
+                type_coercion_diversity: 0,
             }
         );
         assert_eq!(SizeGoals::default().penalties(a.counts), [0, 5, 0, 0, 0]);
         let tiny = analyze("let x;");
         assert!(tiny.validity.is_valid());
         assert_eq!(SizeGoals::default().penalties(tiny.counts), [0, 9, 1, 1, 1]);
+    }
+
+    #[test]
+    fn counts_evolutionary_program_quality_rewards() {
+        let counts = analyze("let x = 1; function f(p) { if (p) { return f(x + p); } }").counts;
+        assert_eq!(counts.rewards(), [4, 3, 1, 2, 0, 0]);
+    }
+
+    #[test]
+    fn counts_state_changes_and_distinct_mixed_type_pairs() {
+        let counts = analyze(
+            r#"
+            let x = 0;
+            x++;
+            x += 1;
+            (({a: 1}).a = 2);
+            ([0][0] = "x");
+            (1 + "x");
+            (true === null);
+            (({}) + []);
+            "#,
+        )
+        .counts;
+        assert_eq!(counts.state_mutations, 4);
+        assert_eq!(counts.type_coercion_diversity, 3);
     }
 }

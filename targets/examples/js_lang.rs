@@ -319,7 +319,13 @@ type Objectives = tuple_list_type!(
     Reverse<usize>,
     Reverse<usize>,
     Reverse<usize>,
-    Reverse<usize>
+    Reverse<usize>,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize
 );
 
 struct Measurement {
@@ -334,6 +340,18 @@ impl MeasurementsCombined for Measurement {
     fn combine_step(self) -> (Objectives, Ratio<usize>, Vec<VecDeque<usize>>) {
         let v = self.analysis.validity;
         let [functions, statements, objects, arrays, loops] = self.sizes;
+        let [
+            variable_reuses,
+            expression_nesting,
+            calls,
+            control_flow,
+            state_mutations,
+            type_coercion_diversity,
+        ] = if v.is_valid() {
+            self.analysis.counts.rewards()
+        } else {
+            [0; 6]
+        };
         let fitness = tuple_list!(
             Reverse(v.syntax),
             Reverse(v.bindings),
@@ -346,7 +364,13 @@ impl MeasurementsCombined for Measurement {
             Reverse(objects),
             Reverse(arrays),
             Reverse(loops),
-            Reverse(self.execution)
+            Reverse(self.execution),
+            variable_reuses,
+            expression_nesting,
+            calls,
+            control_flow,
+            state_mutations,
+            type_coercion_diversity
         );
         // Tree-sitter byte positions are not Fandango tree paths. Leave paths
         // empty so the evolver chooses random mutation/crossover locations;
@@ -368,6 +392,7 @@ struct Statistics {
     coverage: AltPaths,
     covered: usize,
     novel_inputs: u64,
+    accepted_reward_max: [usize; 6],
     executed: u64,
     completed: u64,
     exceptions: u64,
@@ -388,6 +413,7 @@ impl Statistics {
             coverage: AltPaths::new::<javascript::Type<'_>>(k, javascript::STRUCTURE.inner()),
             covered: 0,
             novel_inputs: 0,
+            accepted_reward_max: [0; 6],
             executed: 0,
             completed: 0,
             exceptions: 0,
@@ -404,7 +430,7 @@ impl Statistics {
         let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
         let evaluations = self.evaluated.max(1) as f64;
         println!(
-            "generation={generation} elapsed={seconds:.1}s evaluated={} rate={:.1}/s syntax_ok={} accepted={} acceptance={:.1}% accepted_rate={:.1}/s accepted_and_sized={} mean_bytes={:.1} accepted_alt_paths={}/{} novel_accepted={} executed={} completed={} exceptions={} timeouts={} crashes={} unique_crashes={} mean_exec_ms={:.2}",
+            "generation={generation} elapsed={seconds:.1}s evaluated={} rate={:.1}/s syntax_ok={} accepted={} acceptance={:.1}% accepted_rate={:.1}/s accepted_and_sized={} mean_bytes={:.1} accepted_alt_paths={}/{} novel_accepted={} accepted_reward_max={}/{}/{}/{}/{}/{} executed={} completed={} exceptions={} timeouts={} crashes={} unique_crashes={} mean_exec_ms={:.2}",
             self.evaluated,
             self.evaluated as f64 / seconds,
             self.syntax_ok,
@@ -416,6 +442,12 @@ impl Statistics {
             self.covered,
             self.coverage.lookup().len(),
             self.novel_inputs,
+            self.accepted_reward_max[0],
+            self.accepted_reward_max[1],
+            self.accepted_reward_max[2],
+            self.accepted_reward_max[3],
+            self.accepted_reward_max[4],
+            self.accepted_reward_max[5],
             self.executed,
             self.completed,
             self.exceptions,
@@ -495,6 +527,13 @@ impl<'a> FitnessMeasurerTuple<'a, nonterminal_start, Error> for Measurer {
         if analysis.validity.is_valid() {
             stats.accepted += 1;
             stats.accepted_and_sized += u64::from(sizes == [0; 5]);
+            for (maximum, reward) in stats
+                .accepted_reward_max
+                .iter_mut()
+                .zip(analysis.counts.rewards())
+            {
+                *maximum = (*maximum).max(reward);
+            }
             let newly_covered = stats.coverage.cover(node);
             stats.covered += newly_covered;
             stats.novel_inputs += u64::from(newly_covered > 0);

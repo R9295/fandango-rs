@@ -114,6 +114,12 @@ goals are at most two functions, at least ten statements, and at least one objec
 literal, array literal, and loop. Size never gates acceptance, and reaching full
 validity does not stop evolution. Statement counts include function declarations
 and control-flow statements, but exclude blocks and for-header declarations.
+For valid candidates, six independent rewards maximize references to visible
+bindings, semantic expression nesting, call expressions, control-flow constructs,
+state-changing assignments/updates, and distinct mixed-type operand pairs. The
+last reward recognizes literal/container types and obvious unary or binary
+results. These remain separate NSGA-II objectives, so no fixed score or completion
+threshold is needed. Invalid candidates receive zero for each reward.
 
 The harness uses **k-alt-path** grammar coverage from Section IV of
 [An analysis of the relationship of input metrics](https://arxiv.org/pdf/2609.11824).
@@ -154,6 +160,8 @@ previously unseen path. Duplicate programs add no coverage. The denominator is
 the grammar universe; contextual checks and resource bounds can make some paths
 unattainable. Coverage is a grammar metric, not target code coverage, and never
 gates acceptance or stops the run when saturated.
+`accepted_reward_max` reports the best accepted reuse/nesting/call/control-flow/
+mutation/mixed-type-pair counts seen so far, in that order.
 Execution counters distinguish clean completion, ordinary exceptions, timeouts,
 and, in isolated-process mode, crashes and unique saved crashes. `mean_exec_ms`
 measures evaluation time. Execution never changes validity. Ordinary exceptions
