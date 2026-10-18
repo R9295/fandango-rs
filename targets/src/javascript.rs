@@ -6,6 +6,7 @@
 //! ECMAScript early-error implementation, and does not execute programs.
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -69,13 +70,15 @@ pub struct Counts {
     pub state_mutations: usize,
     /// Distinct statically recognizable mixed-type operand pairs.
     pub type_coercion_diversity: usize,
+    /// Distinct native constructors, static calls, and instance methods.
+    pub native_function_diversity: usize,
 }
 
 impl Counts {
     /// Evolutionary rewards in reuse, nesting, call, control-flow, mutation,
-    /// mixed-type-pair order.
+    /// mixed-type-pair, native-function order.
     #[must_use]
-    pub fn rewards(self) -> [usize; 6] {
+    pub fn rewards(self) -> [usize; 7] {
         [
             self.variable_reuses,
             self.expression_nesting,
@@ -83,6 +86,7 @@ impl Counts {
             self.control_flow,
             self.state_mutations,
             self.type_coercion_diversity,
+            self.native_function_diversity,
         ]
     }
 }
@@ -173,6 +177,7 @@ impl Validator {
             loops: 0,
             expression_depth: 0,
             coercion_pairs: BTreeSet::new(),
+            native_features: BTreeSet::new(),
         };
         // An iterative walk handles even deeply nested rejected source without
         // consuming the Rust stack. Include anonymous children: missing tokens
@@ -211,6 +216,7 @@ struct Checker<'a> {
     loops: usize,
     expression_depth: usize,
     coercion_pairs: BTreeSet<(StaticType, StaticType)>,
+    native_features: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -380,9 +386,49 @@ impl Checker<'_> {
         }
     }
 
+    fn record_native_feature(&mut self, node: Node<'_>) {
+        let feature = match node.kind() {
+            "new_expression" => node
+                .child_by_field_name("constructor")
+                .and_then(|constructor| {
+                    (constructor.kind() == "identifier")
+                        .then(|| format!("new:{}", &self.source[constructor.byte_range()]))
+                }),
+            "call_expression" => node.child_by_field_name("function").and_then(|function| {
+                if function.kind() == "identifier" {
+                    let name = &self.source[function.byte_range()];
+                    matches!(name, "BigInt" | "Object" | "String" | "Symbol")
+                        .then(|| format!("call:{name}"))
+                } else if function.kind() == "member_expression" {
+                    let property = function.child_by_field_name("property")?;
+                    let property = &self.source[property.byte_range()];
+                    if property.starts_with('_') {
+                        return None;
+                    }
+                    let object = function.child_by_field_name("object")?;
+                    let owner =
+                        (object.kind() == "identifier").then(|| &self.source[object.byte_range()]);
+                    Some(owner.map_or_else(
+                        || format!("call:.{property}"),
+                        |owner| format!("call:{owner}.{property}"),
+                    ))
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        };
+        if let Some(feature) = feature
+            && self.native_features.insert(feature)
+        {
+            self.analysis.counts.native_function_diversity += 1;
+        }
+    }
+
     fn record_rewards(&mut self, node: Node<'_>) {
         let kind = node.kind();
         self.record_mutation_and_coercion(node);
+        self.record_native_feature(node);
         if is_expression(kind) {
             self.expression_depth += 1;
             self.analysis.counts.expression_nesting = self
@@ -636,6 +682,7 @@ mod tests {
                 control_flow: 2,
                 state_mutations: 1,
                 type_coercion_diversity: 0,
+                native_function_diversity: 0,
             }
         );
         assert_eq!(SizeGoals::default().penalties(a.counts), [0, 5, 0, 0, 0]);
@@ -647,7 +694,7 @@ mod tests {
     #[test]
     fn counts_evolutionary_program_quality_rewards() {
         let counts = analyze("let x = 1; function f(p) { if (p) { return f(x + p); } }").counts;
-        assert_eq!(counts.rewards(), [4, 3, 1, 2, 0, 0]);
+        assert_eq!(counts.rewards(), [4, 3, 1, 2, 0, 0, 0]);
     }
 
     #[test]
@@ -667,5 +714,14 @@ mod tests {
         .counts;
         assert_eq!(counts.state_mutations, 4);
         assert_eq!(counts.type_coercion_diversity, 3);
+    }
+
+    #[test]
+    fn counts_distinct_native_functionality() {
+        let counts = analyze(
+            "new Map(); (new Map()).set(1, 2); Atomics.isLockFree(8); Promise.resolve(1); [1].sort(); Object.keys({}); Math.imul(2, 3); Symbol('x'); Symbol.for('x'); new WeakSet(); (new WeakSet()).add({});",
+        )
+        .counts;
+        assert_eq!(counts.native_function_diversity, 11);
     }
 }

@@ -325,6 +325,7 @@ type Objectives = tuple_list_type!(
     usize,
     usize,
     usize,
+    usize,
     usize
 );
 
@@ -347,10 +348,11 @@ impl MeasurementsCombined for Measurement {
             control_flow,
             state_mutations,
             type_coercion_diversity,
+            native_function_diversity,
         ] = if v.is_valid() {
             self.analysis.counts.rewards()
         } else {
-            [0; 6]
+            [0; 7]
         };
         let fitness = tuple_list!(
             Reverse(v.syntax),
@@ -370,7 +372,8 @@ impl MeasurementsCombined for Measurement {
             calls,
             control_flow,
             state_mutations,
-            type_coercion_diversity
+            type_coercion_diversity,
+            native_function_diversity
         );
         // Tree-sitter byte positions are not Fandango tree paths. Leave paths
         // empty so the evolver chooses random mutation/crossover locations;
@@ -392,7 +395,7 @@ struct Statistics {
     coverage: AltPaths,
     covered: usize,
     novel_inputs: u64,
-    accepted_reward_max: [usize; 6],
+    accepted_reward_max: [usize; 7],
     executed: u64,
     completed: u64,
     exceptions: u64,
@@ -413,7 +416,7 @@ impl Statistics {
             coverage: AltPaths::new::<javascript::Type<'_>>(k, javascript::STRUCTURE.inner()),
             covered: 0,
             novel_inputs: 0,
-            accepted_reward_max: [0; 6],
+            accepted_reward_max: [0; 7],
             executed: 0,
             completed: 0,
             exceptions: 0,
@@ -430,7 +433,7 @@ impl Statistics {
         let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
         let evaluations = self.evaluated.max(1) as f64;
         println!(
-            "generation={generation} elapsed={seconds:.1}s evaluated={} rate={:.1}/s syntax_ok={} accepted={} acceptance={:.1}% accepted_rate={:.1}/s accepted_and_sized={} mean_bytes={:.1} accepted_alt_paths={}/{} novel_accepted={} accepted_reward_max={}/{}/{}/{}/{}/{} executed={} completed={} exceptions={} timeouts={} crashes={} unique_crashes={} mean_exec_ms={:.2}",
+            "generation={generation} elapsed={seconds:.1}s evaluated={} rate={:.1}/s syntax_ok={} accepted={} acceptance={:.1}% accepted_rate={:.1}/s accepted_and_sized={} mean_bytes={:.1} accepted_alt_paths={}/{} novel_accepted={} accepted_reward_max={}/{}/{}/{}/{}/{}/{} executed={} completed={} exceptions={} timeouts={} crashes={} unique_crashes={} mean_exec_ms={:.2}",
             self.evaluated,
             self.evaluated as f64 / seconds,
             self.syntax_ok,
@@ -448,6 +451,7 @@ impl Statistics {
             self.accepted_reward_max[3],
             self.accepted_reward_max[4],
             self.accepted_reward_max[5],
+            self.accepted_reward_max[6],
             self.executed,
             self.completed,
             self.exceptions,
@@ -810,7 +814,7 @@ mod tests {
             statistics: Rc::clone(&statistics),
             executor: None,
         };
-        let mut generators = tuple_list!(DepthLimiter::new(javascript::STRUCTURE.inner(), 24));
+        let mut generators = tuple_list!(DepthLimiter::new(javascript::STRUCTURE.inner(), 8));
         let mut sampler = StdRng::seed_from_u64(7);
         let total = statistics.borrow().coverage.lookup().len();
         let mut rejected = 0;
