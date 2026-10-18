@@ -69,7 +69,10 @@ cat compiler-testing-results/c_lang_*.txt
 ## Continuous JavaScript generation
 
 The `js_lang` example evolves ordinary JavaScript scripts with NSGA-II. It uses
-`tree-sitter` and `tree-sitter-javascript` in-process; Node.js is not required.
+`tree-sitter` and `tree-sitter-javascript` for parsing. On macOS it also embeds
+the system WebKit JavaScriptCore and executes accepted programs in-process. Node.js
+is not required. Other platforms default to the `JSC` environment variable or
+`jsc` on `PATH`.
 
 ```sh
 RUSTFLAGS="-Znext-solver" cargo run --release -p fandango-targets --features javascript --example js_lang
@@ -80,10 +83,23 @@ This runs until interrupted. For a reproducible, bounded run, append
 between generations, including initial population creation in elapsed time.
 Append `-- --help` to see all settings.
 
+Embedded execution creates a fresh global context per program inside one shared
+VM. JavaScriptCore's watchdog enforces the default 250 ms timeout. Before each
+evaluation, `js-crashes/last-input.js` is overwritten with the active input; if
+JavaScriptCore crashes, the harness terminates and that file is the reproducer.
+Uncaught exceptions and watchdog timeouts are expected results.
+
+Use `--jsc PATH` to run a custom or sanitizer-enabled shell in an isolated process
+instead. This slower mode can classify signals, sanitizer reports, WebKit
+assertions, and fatal exits, then save unique `.js` reproducers and `.txt` reports.
+Stderr is retained up to 64 KiB. `--jsc-arg` adds shell options,
+`--exec-timeout-ms` changes the limit, `--crash-dir` moves artifacts, and
+`--no-exec` disables execution.
+
 The grammar includes `let`/`const`, expressions, functions and calls, objects,
 arrays, conditionals, and for/for-in/for-of/while/do-while loops. It excludes
 modules, JSX, `var`, classes, async/generators, labels, and destructuring.
-Programs are never executed, saved, or sent to a target.
+Only crash reproducers are saved; ordinary generated programs are discarded.
 
 Acceptance requires a Tree-sitter tree without error or missing nodes and no
 contextual violations: conflicting lexical bindings, missing `const`
@@ -138,6 +154,12 @@ previously unseen path. Duplicate programs add no coverage. The denominator is
 the grammar universe; contextual checks and resource bounds can make some paths
 unattainable. Coverage is a grammar metric, not target code coverage, and never
 gates acceptance or stops the run when saturated.
+Execution counters distinguish clean completion, ordinary exceptions, timeouts,
+and, in isolated-process mode, crashes and unique saved crashes. `mean_exec_ms`
+measures evaluation time. Execution never changes validity. Ordinary exceptions
+add one independent soft fitness penalty; clean exits, timeouts, and crashes add
+zero. This guides evolution toward code that runs inside the engine while
+retaining hot loops.
 Every created candidate is measured once, including initial candidates and
 discarded offspring; the counters include duplicate programs. The harness retains
 the current population, aggregate counters, and fixed coverage tables, without an
