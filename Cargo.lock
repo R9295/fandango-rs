@@ -610,6 +610,7 @@ dependencies = [
  "hashbrown 0.16.0",
  "mappable-rc",
  "num-rational",
+ "pest",
 ]
 
 [[package]]

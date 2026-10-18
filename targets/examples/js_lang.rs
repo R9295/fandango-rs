@@ -4,21 +4,23 @@
 //! runs until interrupted. Candidates are counted as they are created, including
 //! offspring that do not survive selection. No corpus or execution target is used.
 
+#![feature(alloc_error_hook)]
+
 use anyhow::{Error, anyhow, bail};
 use fandango::generation::{Generated, Sampler};
 use fandango::lang::FandangoNode;
 use fandango::tuple_list::{tuple_list, tuple_list_type};
 use fandango::typing::{AsNodeRef, Node, Opaque};
+use fandango::visitor::altpath::AltPaths;
 use fandango::visitor::navigation::CountNodes;
 use fandango::visitor::write::WriteVisitor;
 use fandango::visitor::{VisitResult, VisitableChildren, Visitor};
 use fandango_runtime::evolvers::Evolver;
 use fandango_runtime::evolvers::basic::BasicHook;
 use fandango_runtime::evolvers::multi::{
-    FitnessMeasurerTuple, MeasurementsCombined, Nsga2Evolver, Nsga2Hook,
+    AltPathDiversityHook, FitnessMeasurerTuple, MeasurementsCombined, Nsga2Evolver,
 };
 use fandango_runtime::operators::DepthLimiter;
-use fandango_runtime::population::Individual;
 use fandango_targets::javascript::{self, Analysis, SizeGoals, Validator, nonterminal_start};
 use num_rational::Ratio;
 use rand::rngs::StdRng;
@@ -27,6 +29,7 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -36,6 +39,7 @@ const USAGE: &str = "Usage: js_lang [OPTIONS]
   --offspring N        New candidates per generation [100]
   --crossover N        Crossover percentage among evolved candidates [80]
   --fresh N            Percentage replaced with fresh random candidates [10]
+  --alt-k N            Alternation choices per coverage path, positive integer [2]
   --seed N             Reproducible RNG seed [random; printed at startup]
   --generations N      Stop after N evolution steps [unlimited; 0 = initial only]
   --seconds N          Stop after N seconds, checked between generations [unlimited]
@@ -53,7 +57,9 @@ const USAGE: &str = "Usage: js_lang [OPTIONS]
 
 No time or generation limit is imposed by default; interrupt to stop.
 Statistics count evaluations (including duplicates), not unique programs.
-Size goals never gate acceptance. Programs are parsed, never executed or saved.";
+Size goals never gate acceptance. Programs are parsed, never executed or saved.
+Rare k-alt-paths break Pareto-front ties; coverage reports count accepted inputs.
+Large --alt-k values can exhaust memory; path counts grow exponentially.";
 
 #[derive(Clone, Copy, Debug)]
 struct Bounds {
@@ -68,6 +74,7 @@ struct Options {
     offspring: usize,
     crossover: usize,
     fresh: usize,
+    alt_k: NonZeroUsize,
     seed: Option<u64>,
     generations: Option<usize>,
     seconds: Option<u64>,
@@ -84,6 +91,7 @@ impl Default for Options {
             offspring: 100,
             crossover: 80,
             fresh: 10,
+            alt_k: NonZeroUsize::new(2).unwrap(),
             seed: None,
             generations: None,
             seconds: None,
@@ -115,6 +123,10 @@ impl Options {
                 "--offspring" => options.offspring = number,
                 "--crossover" => options.crossover = number,
                 "--fresh" => options.fresh = number,
+                "--alt-k" => {
+                    options.alt_k = NonZeroUsize::new(number)
+                        .ok_or_else(|| anyhow!("alt-k must be positive"))?;
+                }
                 "--seed" => options.seed = Some(value.parse()?),
                 "--generations" => options.generations = Some(number),
                 "--seconds" => options.seconds = Some(value.parse()?),
@@ -249,14 +261,6 @@ where
     }
 }
 
-impl<I, G, S> Nsga2Hook<I, G, S> for GenerationHook
-where
-    I: Individual,
-    I::Node: Node + Generated<S, G>,
-    S: Sampler<I::Node>,
-{
-}
-
 type Objectives = tuple_list_type!(
     Reverse<usize>,
     Reverse<usize>,
@@ -306,23 +310,38 @@ impl MeasurementsCombined for Measurement {
     }
 }
 
-#[derive(Default)]
 struct Statistics {
     evaluated: u64,
     syntax_ok: u64,
     accepted: u64,
     accepted_and_sized: u64,
     bytes: u64,
+    coverage: AltPaths,
+    covered: usize,
+    novel_inputs: u64,
 }
 
 impl Statistics {
+    fn new(k: NonZeroUsize) -> Self {
+        Self {
+            evaluated: 0,
+            syntax_ok: 0,
+            accepted: 0,
+            accepted_and_sized: 0,
+            bytes: 0,
+            coverage: AltPaths::new::<javascript::Type<'_>>(k, javascript::STRUCTURE.inner()),
+            covered: 0,
+            novel_inputs: 0,
+        }
+    }
+
     // Approximate floating-point rates are display-only; counters remain exact.
     #[allow(clippy::cast_precision_loss)]
     fn report(&self, generation: usize, elapsed: Duration) {
         let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
         let evaluations = self.evaluated.max(1) as f64;
         println!(
-            "generation={generation} elapsed={seconds:.1}s evaluated={} rate={:.1}/s syntax_ok={} accepted={} acceptance={:.1}% accepted_rate={:.1}/s accepted_and_sized={} mean_bytes={:.1}",
+            "generation={generation} elapsed={seconds:.1}s evaluated={} rate={:.1}/s syntax_ok={} accepted={} acceptance={:.1}% accepted_rate={:.1}/s accepted_and_sized={} mean_bytes={:.1} accepted_alt_paths={}/{} novel_accepted={}",
             self.evaluated,
             self.evaluated as f64 / seconds,
             self.syntax_ok,
@@ -331,6 +350,9 @@ impl Statistics {
             self.accepted as f64 / seconds,
             self.accepted_and_sized,
             self.bytes as f64 / evaluations,
+            self.covered,
+            self.coverage.lookup().len(),
+            self.novel_inputs,
         );
     }
 }
@@ -360,6 +382,9 @@ impl<'a> FitnessMeasurerTuple<'a, nonterminal_start, Error> for Measurer {
         if analysis.validity.is_valid() {
             stats.accepted += 1;
             stats.accepted_and_sized += u64::from(sizes == [0; 5]);
+            let newly_covered = stats.coverage.cover(node);
+            stats.covered += newly_covered;
+            stats.novel_inputs += u64::from(newly_covered > 0);
         }
         Ok(Measurement { analysis, sizes })
     }
@@ -368,7 +393,7 @@ impl<'a> FitnessMeasurerTuple<'a, nonterminal_start, Error> for Measurer {
 fn run(options: &Options) -> Result<(), Error> {
     let seed = options.seed.unwrap_or_else(|| rand::rng().random());
     let mut sampler = StdRng::seed_from_u64(seed);
-    let stats = Rc::new(RefCell::new(Statistics::default()));
+    let stats = Rc::new(RefCell::new(Statistics::new(options.alt_k)));
     let measurer = Measurer {
         validator: Validator::new()?,
         goals: options.goals,
@@ -376,10 +401,13 @@ fn run(options: &Options) -> Result<(), Error> {
     };
     let mut evolver = Nsga2Evolver::new::<nonterminal_start>(
         measurer,
-        GenerationHook {
-            bounds: options.bounds,
-            fresh: options.fresh,
-        },
+        AltPathDiversityHook::new(
+            GenerationHook {
+                bounds: options.bounds,
+                fresh: options.fresh,
+            },
+            options.alt_k,
+        ),
         options.population,
         options.offspring,
         Ratio::new(options.crossover, 100),
@@ -390,8 +418,8 @@ fn run(options: &Options) -> Result<(), Error> {
         options.generation_depth
     ));
     println!(
-        "JavaScript NSGA-II seed={seed} population={} offspring={} crossover={}% fresh={}%",
-        options.population, options.offspring, options.crossover, options.fresh
+        "JavaScript NSGA-II seed={seed} population={} offspring={} crossover={}% fresh={}% alt_k={}",
+        options.population, options.offspring, options.crossover, options.fresh, options.alt_k
     );
     println!(
         "soft_goals={:?}; Tree-sitter + contextual checks; no execution or delivery",
@@ -421,7 +449,22 @@ fn run(options: &Options) -> Result<(), Error> {
     Ok(())
 }
 
+fn install_oom_warning() {
+    std::alloc::set_alloc_error_hook(|layout| {
+        use std::io::Write;
+
+        // Format directly to stderr without allocating a message buffer. Ignore
+        // write failures: the runtime will abort after this hook returns.
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "warning: out of memory (allocation of {} bytes failed). Reduce --alt-k or population sizes; aborting.",
+            layout.size()
+        );
+    });
+}
+
 fn main() -> Result<(), Error> {
+    install_oom_warning();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("{USAGE}");
@@ -441,6 +484,7 @@ mod tests {
             vec!["--offspring", "0"],
             vec!["--fresh", "101"],
             vec!["--crossover", "101"],
+            vec!["--alt-k", "0"],
             vec!["--seconds", "0"],
             vec!["--max-depth", "10000"],
             vec!["--report-every", "0"],
@@ -451,6 +495,10 @@ mod tests {
         }
         let defaults = Options::default();
         assert!(defaults.generations.is_none() && defaults.seconds.is_none());
+        for k in [1, 5, usize::MAX] {
+            let options = Options::parse(["--alt-k".to_owned(), k.to_string()]).unwrap();
+            assert_eq!(options.alt_k.get(), k);
+        }
     }
 
     #[test]
@@ -506,7 +554,8 @@ mod tests {
 
     #[test]
     fn evolution_keeps_running_and_counts_every_offspring() {
-        let statistics = Rc::new(RefCell::new(Statistics::default()));
+        let k = NonZeroUsize::new(2).unwrap();
+        let statistics = Rc::new(RefCell::new(Statistics::new(k)));
         let mut evolver = Nsga2Evolver::new::<nonterminal_start>(
             Measurer {
                 validator: Validator::new().unwrap(),
@@ -516,14 +565,17 @@ mod tests {
             // Every candidate is reduced to an empty, valid script. Its soft
             // goals remain unmet, but generation must continue and acceptance
             // must still count it.
-            GenerationHook {
-                bounds: Bounds {
-                    nodes: 8,
-                    depth: 8,
-                    bytes: 1,
+            AltPathDiversityHook::new(
+                GenerationHook {
+                    bounds: Bounds {
+                        nodes: 8,
+                        depth: 8,
+                        bytes: 1,
+                    },
+                    fresh: 10,
                 },
-                fresh: 10,
-            },
+                k,
+            ),
             4,
             6,
             Ratio::new(80, 100),
@@ -542,5 +594,42 @@ mod tests {
         assert_eq!(stats.evaluated, 4 + 6 + 3 * 6);
         assert_eq!(stats.accepted, stats.evaluated);
         assert_eq!(stats.accepted_and_sized, 0);
+        assert_eq!(stats.covered, 1);
+        assert_eq!(stats.novel_inputs, 1);
+    }
+
+    #[test]
+    fn only_accepted_inputs_add_coverage_and_duplicates_do_not() {
+        let statistics = Rc::new(RefCell::new(Statistics::new(NonZeroUsize::new(2).unwrap())));
+        let mut measurer = Measurer {
+            validator: Validator::new().unwrap(),
+            goals: SizeGoals::default(),
+            statistics: Rc::clone(&statistics),
+        };
+        let mut generators = tuple_list!(DepthLimiter::new(javascript::STRUCTURE.inner(), 24));
+        let mut sampler = StdRng::seed_from_u64(7);
+        let total = statistics.borrow().coverage.lookup().len();
+        let mut rejected = 0;
+        for _ in 0..200 {
+            let node = nonterminal_start::generate(&mut sampler, &mut generators, 0);
+            let before = statistics.borrow().covered;
+            let measurement = measurer.evaluate(&node).unwrap();
+            let after = statistics.borrow().covered;
+            if measurement.analysis.validity.is_valid() {
+                assert!(after >= before);
+            } else {
+                rejected += 1;
+                assert_eq!(after, before);
+            }
+            let novel_before = statistics.borrow().novel_inputs;
+            measurer.evaluate(&node).unwrap();
+            let stats = statistics.borrow();
+            assert_eq!(stats.covered, after);
+            assert_eq!(stats.novel_inputs, novel_before);
+            assert_eq!(stats.coverage.lookup().len(), total);
+            assert_eq!(stats.coverage.alt_paths(), (total - after, total));
+        }
+        assert!(rejected > 0);
+        assert!(statistics.borrow().covered > 1);
     }
 }

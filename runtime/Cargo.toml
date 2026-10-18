@@ -13,5 +13,8 @@ hashbrown.workspace = true
 mappable-rc.workspace = true
 num-rational.workspace = true
 
+[dev-dependencies]
+pest.workspace = true
+
 [lints]
 workspace = true

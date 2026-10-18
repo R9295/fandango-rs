@@ -14,12 +14,13 @@ use core::marker::PhantomData;
 use core::num::NonZeroUsize;
 use core::ops::ControlFlow;
 use fandango::generation::{Generated, InPlaceGenerated, Sampler};
-use fandango::lang::FandangoNode;
+use fandango::lang::{FandangoNode, Program};
 use fandango::typing::{AsNode, Node, NodeLookup};
-use fandango::visitor::altpath::{AltPathUpdate, AltPathVisit, AltPathVisitor, AltPaths};
+use fandango::visitor::altpath::AltPaths;
 use fandango::visitor::kpath::{KPathUpdate, KPathVisit, KPathVisitor, KPaths};
 use fandango::visitor::navigation::{Advance, CountNodes, GoToMut};
 use fandango::visitor::{VisitWithMut, VisitableChildrenMut, Visitor, VisitorMut};
+use hashbrown::HashMap;
 use mappable_rc::Mrc;
 use num_rational::Ratio;
 
@@ -251,24 +252,34 @@ where
 
 impl<I, G, S> Nsga2Hook<I, G, S> for () where I: Individual {}
 
-/// A [`Nsga2Hook`] which wraps a [`BasicHook`] and optimizes diversity by rare k-paths
-/// Like [`KPathDiversityHook`], but drives population diversity with **k-alt-path**
-/// instead of k-path.
+/// A [`Nsga2Hook`] which wraps a [`BasicHook`] and favors rare k-alt-paths.
 ///
-/// Alt-paths only record alternation choices, so the signal is not diluted by the
-/// nonterminal and concatenation steps that expansion always takes. That makes it a
-/// sharper diversity gradient per unit of bookkeeping: k-alt-path covers (k+1)-path with
-/// substantially fewer subdomains to store and count.
+/// Rarity is the number of individuals in the last Pareto front containing a path,
+/// including terminal branches. Each individual ranks by its rarest path; ties
+/// retain their previous order. Frequencies are recomputed on every sort, while the
+/// grammar's path universe is cached. This selection heuristic uses the metric from
+/// <https://arxiv.org/pdf/2609.11824>; it is not an algorithm specified by the paper.
 pub struct AltPathDiversityHook<H> {
     k: NonZeroUsize,
     inner: H,
+    cache: Option<AltPathCache>,
+}
+
+struct AltPathCache {
+    program: &'static Program<'static>,
+    node_type: &'static str,
+    paths: AltPaths,
 }
 
 impl<H> AltPathDiversityHook<H> {
     /// Create the hook over the provided [`BasicHook`] and with some `k`, where `k` bounds
     /// the number of alternations a path may traverse.
     pub fn new(inner: H, k: NonZeroUsize) -> Self {
-        Self { k, inner }
+        Self {
+            k,
+            inner,
+            cache: None,
+        }
     }
 }
 
@@ -291,74 +302,39 @@ where
     H: BasicHook<I::Node, G, S>,
     I: Individual,
     I::Node: Node + AsNode,
-    for<'a> <I::Node as Node>::Type<'a>: NodeLookup,
 {
     fn diversity_sort(&mut self, individuals: &mut [I]) {
-        struct MinObserved<T> {
-            fewest: usize,
-            phantom: PhantomData<T>,
-        }
-
-        impl<T> MinObserved<T> {
-            pub fn new() -> Self {
-                Self {
-                    fewest: usize::MAX,
-                    phantom: PhantomData,
-                }
-            }
-        }
-
-        impl<T> AltPathVisitor for MinObserved<T>
-        where
-            T: NodeLookup,
-        {
-            type Value = usize;
-            type Break = Infallible;
-            type Error = Infallible;
-
-            fn visit_path(
-                &mut self,
-                count: usize,
-                path: &Mrc<[usize]>,
-            ) -> Result<ControlFlow<Self::Break>, Self::Error> {
-                if !matches!(
-                    T::lookup_node(*path.last().unwrap()),
-                    FandangoNode::String(_)
-                ) {
-                    self.fewest = self.fewest.min(count);
-                }
-                Ok(ControlFlow::Continue(()))
-            }
-
-            fn value(self) -> Self::Value {
-                self.fewest
-            }
-        }
-
-        let FandangoNode::Program(program) = individuals[0].node().root() else {
+        let Some(first) = individuals.first() else {
+            return;
+        };
+        let FandangoNode::Program(program) = first.node().root() else {
             panic!("The root node wasn't a program node!")
         };
-        let mut altpaths = AltPaths::new::<<I::Node as Node>::Type<'_>>(self.k, program);
-        let mut update = AltPathUpdate::inserting(&mut altpaths);
-        for individual in individuals.iter() {
-            update = update
-                .visit(individual.node(), 0)
-                .unwrap()
-                .continue_value()
-                .unwrap();
+        let node_type = core::any::type_name::<I::Node>();
+        if self.cache.as_ref().is_none_or(|cache| {
+            !core::ptr::eq(cache.program, program) || cache.node_type != node_type
+        }) {
+            self.cache = Some(AltPathCache {
+                program,
+                node_type,
+                paths: AltPaths::new::<<I::Node as Node>::Type<'_>>(self.k, program),
+            });
+        }
+        let paths = &self.cache.as_ref().unwrap().paths;
+        let mut counts = HashMap::<_, usize>::new();
+        for individual in &*individuals {
+            for path in paths.paths_in(individual.node()) {
+                *counts.entry(path).or_default() += 1;
+            }
         }
 
-        // Individuals covering the rarest alt-path sort first.
         individuals.sort_by_cached_key(|individual| {
-            AltPathVisit::new(
-                update.altpaths(),
-                MinObserved::<<I::Node as Node>::Type<'_>>::new(),
-            )
-            .visit(individual.node(), 0)
-            .unwrap()
-            .continue_value()
-            .unwrap()
-            .value()
+            paths
+                .paths_in(individual.node())
+                .iter()
+                .map(|path| counts[path])
+                .min()
+                .unwrap_or(usize::MAX)
         });
     }
 }

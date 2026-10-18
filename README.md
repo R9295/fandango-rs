@@ -99,6 +99,29 @@ literal, array literal, and loop. Size never gates acceptance, and reaching full
 validity does not stop evolution. Statement counts include function declarations
 and control-flow statements, but exclude blocks and for-header declarations.
 
+The harness uses **k-alt-path** grammar coverage from Section IV of
+[An analysis of the relationship of input metrics](https://arxiv.org/pdf/2609.11824).
+Paths begin at an alternation and end immediately after an alternation's chosen
+edge, retaining every intervening node. `k` counts choice edges, not tree depth;
+all paths with one through `k` choices are included, including terminal branches.
+Separate references to the same nonterminal retain their source positions, so
+left and right operands can contribute different paths.
+Only rules reachable from `<start>` contribute to the universe. The implementation
+enumerates paths without a node-length cutoff and rejects mandatory recursive
+cycles without a choice. Repetition and optional operators are also rejected:
+use recursive alternatives, as the paper does not define these operators.
+
+`--alt-k 2` is the default; any positive value fitting `usize` is accepted.
+The path universe grows exponentially, so large values can exhaust memory.
+The harness uses Rust's nightly allocation-error hook to print a warning with
+the failed allocation size before aborting. An OS kill cannot run this handler.
+Within the final Pareto front, candidates
+containing rarer paths are preferred. Rarity counts distinct individuals, not
+repeated occurrences within a program, and is recalculated each generation.
+Each candidate ranks by its rarest path, with stable ordering for ties. This
+selection heuristic is our use of the paper's metric; the paper does not specify
+an evolutionary algorithm. It leaves validity and size objectives independent.
+
 Defaults are 100 survivors, 100 offspring per generation, 80% crossover, and 10%
 fresh random replacements. The hook limits retained trees to 4,096 nodes,
 depth 128, and 65,536 source bytes; generation switches to shortest expansions at
@@ -109,11 +132,17 @@ positions are not Fandango tree paths.
 
 Reports show evaluations/second, syntax passes, acceptance rate, accepted
 programs/second, accepted programs meeting all size goals, and mean source size.
+`accepted_alt_paths=covered/total` tracks cumulative coverage from accepted
+programs, and `novel_accepted` counts accepted evaluations adding at least one
+previously unseen path. Duplicate programs add no coverage. The denominator is
+the grammar universe; contextual checks and resource bounds can make some paths
+unattainable. Coverage is a grammar metric, not target code coverage, and never
+gates acceptance or stops the run when saturated.
 Every created candidate is measured once, including initial candidates and
 discarded offspring; the counters include duplicate programs. The harness retains
-the current population and aggregate counters, without an accumulating corpus or
-history. The seed printed at startup can reproduce generation when used with a
-generation limit and identical settings.
+the current population, aggregate counters, and fixed coverage tables, without an
+accumulating corpus or source history. The seed printed at startup can reproduce
+generation when used with a generation limit and identical settings.
 
 ## Navigating this repository
 
