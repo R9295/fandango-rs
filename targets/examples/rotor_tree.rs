@@ -1,8 +1,7 @@
 //! Generate one lineage of blocks from `grammars/rotor_tree.fan`, with forks, delivered by
 //! turbine and repair, and flatten it into an action list for Firedancer's rotor.
 //!
-//! The grammar picks how many blocks the lineage has, how many FEC sets each has, and how many
-//! forks each slot has. The lineage can be any length, bounded only by `--depth`. Each lineage
+//! The grammar picks how many blocks the lineage has and how many forks each slot has. The lineage can be any length, bounded only by `--depth`. Each lineage
 //! block builds on the one before it, with one in [`GAP_ONE_IN`] slots between them skipped: the
 //! lineage has no block there. It skips never so many that the next block falls out of the
 //! window. Every lineage block is finalized, but for the tip in one in [`OPEN_TIP_ONE_IN`]
@@ -64,8 +63,8 @@
 //! `REPAIR` if it is repairable and `DEAD` if it is dead, and each `SKIPPED` slot is drawn in slot order with
 //! `SKIPPED`. A block under a skipped slot names its parent.
 //!
-//! Each lineage is written as JSON. `blocks` lists each node in slot order with its parent, its
-//! number of FEC sets, as `repair` whether it is repairable, and as `replay` whether the node
+//! Each lineage is written as JSON. `blocks` lists each node in slot order with its parent, as
+//! `repair` whether it is repairable, and as `replay` whether the node
 //! replays it: `yes` if repair always delivers it in full, and `maybe` if that depends on the order rotor sees its slot's versions in, as for every
 //! fork, or on whether the FEC resolver spills a set turbine sends once, and `dead` whether its
 //! footer declares a wrong bank hash. One in [`DEAD_ONE_IN`] blocks the cluster does not finalize
@@ -149,9 +148,6 @@ const SKIPPED_FORKS: [(usize, u32); 6] = [(0, 3), (1, 2), (2, 1), (3, 1), (4, 1)
 /// footer declares a bank hash its execution does not reach, so replay marks it dead.
 const DEAD_ONE_IN: u32 = 4;
 
-/// The most FEC sets a block has, as the grammar's `<fecs>`.
-const FECS_MAX: u32 = 4;
-
 /// Every shred of a block arrives from turbine.
 const TURBINE: &str = "TURBINE";
 /// A finalization certificate names a block.
@@ -175,7 +171,6 @@ struct Block {
     lineage: Option<usize>,
     /// Its slot has forks.
     forked: bool,
-    fecs: u32,
     finalized: bool,
     /// Gets a finalization certificate of its own.
     certified: bool,
@@ -224,14 +219,14 @@ fn replay_alive(blocks: &[Block], b: usize) -> &'static str {
     }
 }
 
-/// Give each lineage block of `counts` FEC sets and forks' FEC sets a slot, and pick which
+/// Give each lineage block, with `forks[b]` forks in its slot, a slot, and pick which
 /// blocks are finalized and which get their own certificate. Then pick, from `repair_rng`, which
 /// are repairable and how many forks each skipped slot holds, and from `fork_rng` each fork's
 /// parent.
-fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rng: &mut StdRng, fork_rng: &mut StdRng) -> Vec<Block> {
-    let mut slots = Vec::with_capacity(counts.len());
+fn plan(forks: &[usize], slot_max: usize, rng: &mut StdRng, repair_rng: &mut StdRng, fork_rng: &mut StdRng) -> Vec<Block> {
+    let mut slots = Vec::with_capacity(forks.len());
     let mut slot = 0;
-    for _ in counts {
+    for _ in forks {
         let after = slot;
         slot += 1;
         while slot + 1 < after + slot_max && rng.random_ratio(1, GAP_ONE_IN) {
@@ -239,13 +234,13 @@ fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rn
         }
         slots.push(slot);
     }
-    let finals = if rng.random_ratio(1, OPEN_TIP_ONE_IN) { counts.len() - 1 } else { counts.len() };
+    let finals = if rng.random_ratio(1, OPEN_TIP_ONE_IN) { forks.len() - 1 } else { forks.len() };
     // The slot of the last block with a certificate of its own, the deepest the node can have
     // finalized before the next block's shreds.
     let mut certified_slot = 0;
-    let mut blocks = Vec::with_capacity(counts.len());
-    for (b, (fecs, forks)) in counts.iter().enumerate() {
-        let (fecs, forked) = (*fecs, !forks.is_empty());
+    let mut blocks = Vec::with_capacity(forks.len());
+    for (b, &count) in forks.iter().enumerate() {
+        let forked = count > 0;
         let finalized = b < finals;
         let next = slots.get(b + 1);
         // Certify at random, and wherever the next block would not fit the window otherwise.
@@ -261,18 +256,17 @@ fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rn
             parent: b.checked_sub(1),
             lineage: Some(b),
             forked,
-            fecs,
             finalized,
             certified,
             repairable,
             dead: false,
         });
     }
-    // Add to `forks` a fork of `fecs` FEC sets in `slot`, at or before lineage block `b`'s,
+    // Add to `forks` a fork in `slot`, at or before lineage block `b`'s,
     // repairable if `repairable`. It builds on lineage block `b - 1` half the time, else on any
     // block before `slot`: a lineage block before `b` or a fork in `forks`.
-    let lineage_len = counts.len();
-    let fork = |rng: &mut StdRng, forks: &mut Vec<Block>, slot: usize, b: usize, version: u8, fecs: u32, lineage: Option<usize>, repairable: bool| {
+    let lineage_len = forks.len();
+    let fork = |rng: &mut StdRng, forks: &mut Vec<Block>, slot: usize, b: usize, version: u8, lineage: Option<usize>, repairable: bool| {
         let earlier: Vec<usize> =
             (0..b).chain(forks.iter().enumerate().filter(|(_, f)| f.slot < slot).map(|(i, _)| lineage_len + i)).collect();
         let parent = if earlier.is_empty() || rng.random_bool(0.5) { b.checked_sub(1) } else { Some(earlier[rng.random_range(0..earlier.len())]) };
@@ -282,7 +276,6 @@ fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rn
             parent,
             lineage,
             forked: true,
-            fecs,
             finalized: false,
             certified: false,
             repairable,
@@ -292,18 +285,17 @@ fn plan(counts: &[(u32, Vec<u32>)], slot_max: usize, rng: &mut StdRng, repair_rn
     // In slot order, so a fork can build on any fork before it.
     let mut forks_of = Vec::new();
     let weight_total: u32 = SKIPPED_FORKS.iter().map(|&(_, weight)| weight).sum();
-    for (b, (_, forks)) in counts.iter().enumerate() {
+    for (b, &count) in forks.iter().enumerate() {
         for slot in b.checked_sub(1).map_or(0, |prev| slots[prev]) + 1..slots[b] {
             let mut pick = repair_rng.random_range(0..weight_total);
-            let count = SKIPPED_FORKS.iter().find(|&&(_, weight)| pick < weight || { pick -= weight; false }).map_or(0, |&(count, _)| count);
-            let repairable = (count > 0 && repair_rng.random_ratio(1, REPAIR_ONE_IN)).then(|| repair_rng.random_range(0..count));
-            for (i, version) in (1..).take(count).enumerate() {
-                let fecs = fork_rng.random_range(1..=FECS_MAX);
-                fork(fork_rng, &mut forks_of, slot, b, version, fecs, None, repairable == Some(i));
+            let skipped = SKIPPED_FORKS.iter().find(|&&(_, weight)| pick < weight || { pick -= weight; false }).map_or(0, |&(count, _)| count);
+            let repairable = (skipped > 0 && repair_rng.random_ratio(1, REPAIR_ONE_IN)).then(|| repair_rng.random_range(0..skipped));
+            for (i, version) in (1..).take(skipped).enumerate() {
+                fork(fork_rng, &mut forks_of, slot, b, version, None, repairable == Some(i));
             }
         }
-        for (version, &fecs) in (1..).zip(forks) {
-            fork(fork_rng, &mut forks_of, slots[b], b, version, fecs, Some(b), false);
+        for version in (1..).take(count) {
+            fork(fork_rng, &mut forks_of, slots[b], b, version, Some(b), false);
         }
     }
     blocks.extend(forks_of);
@@ -524,8 +516,8 @@ fn blocks_json(blocks: &[Block]) -> Vec<String> {
             let (node, parent, block) = (label(blocks, Some(b)), parent(blocks, b), &blocks[b]);
             let replay = replay(blocks, b);
             format!(
-                "{{\"node\": \"{node}\", \"parent\": \"{parent}\", \"fecs\": {}, \"repair\": {}, \"replay\": \"{replay}\", \"dead\": {}}}",
-                block.fecs, block.repairable, block.dead
+                "{{\"node\": \"{node}\", \"parent\": \"{parent}\", \"repair\": {}, \"replay\": \"{replay}\", \"dead\": {}}}",
+                block.repairable, block.dead
             )
         })
         .collect()
@@ -565,21 +557,16 @@ fn main() -> Result<(), Error> {
             .expect("write visitor never breaks")
             .output();
         let json: Value = serde_json::from_slice(&bytes).context("the grammar generates JSON")?;
-        let fecs = |block: &Value| -> Result<u32, Error> {
-            let fecs = block["fecs"].as_u64().context("a block without FEC sets")?;
-            u32::try_from(fecs).context("a block with too many FEC sets")
-        };
-        let counts = json["blocks"]
+        let forks = json["blocks"]
             .as_array()
             .context("a lineage without blocks")?
             .iter()
             .map(|block| {
-                let forks = block["forks"].as_array().context("a block without forks")?;
-                Ok((fecs(block)?, forks.iter().map(fecs).collect::<Result<Vec<_>, Error>>()?))
+                Ok(block["forks"].as_array().context("a block without forks")?.len())
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
-        let mut blocks = plan(&counts, args.slot_max, &mut fate_rng, &mut repair_rng, &mut fork_rng);
+        let mut blocks = plan(&forks, args.slot_max, &mut fate_rng, &mut repair_rng, &mut fork_rng);
         for block in &mut blocks {
             block.dead = !block.finalized && dead_rng.random_ratio(1, DEAD_ONE_IN);
         }
