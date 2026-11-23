@@ -94,6 +94,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -148,12 +149,32 @@ const SKIPPED_FORKS: [(usize, u32); 6] = [(0, 3), (1, 2), (2, 1), (3, 1), (4, 1)
 /// footer declares a bank hash its execution does not reach, so replay marks it dead.
 const DEAD_ONE_IN: u32 = 4;
 
+/// Alpenglow leader window size (consecutive leader slots).
+const LEADER_WINDOW_SLOTS: usize = 4;
+
+/// Under Alpenglow's <20% Byzantine stake bound:
+/// - A slot with no `Notarize`/`Finalize` cert can have at most 4 conflicting `NotarizeFallback` certs.
+/// - A slot with a `Notarize` cert (and no `Finalize` cert) can have at most 1 conflicting `NotarizeFallback` cert.
+/// - A finalized slot (`Finalize` / `FinalizeFast`) can have 0 conflicting `NotarizeFallback` certs.
+const MAX_NOTAR_FALLBACK_BLOCKS: usize = 4;
+const MAX_NOTAR_FALLBACK_WITH_NOTAR: usize = 1;
+
+/// One in this many implied-finalized lineage blocks (finalized only via a descendant's `FINAL`)
+/// receives a `NOTAR_FALLBACK` certificate instead of `NOTAR`.
+const NOTAR_FALLBACK_LINEAGE_ONE_IN: u32 = 2;
+
+/// Probability (1 in N) that an eligible non-dead fork or open tip gets a `NOTAR_FALLBACK`
+/// certificate, subject to the per-slot Alpenglow bounds above.
+const NOTAR_FALLBACK_FORK_ONE_IN: u32 = 2;
+
 /// Every shred of a block arrives from turbine.
 const TURBINE: &str = "TURBINE";
 /// A finalization certificate names a block.
 const FINAL: &str = "FINAL";
 /// A notarization certificate names a block.
 const NOTAR: &str = "NOTAR";
+/// A notarization-fallback certificate names a block.
+const NOTAR_FALLBACK: &str = "NOTAR_FALLBACK";
 /// A finalized block after a slot declares it skipped.
 const SKIPPED: &str = "SKIPPED";
 /// The mock starts serving repair for a repairable block.
@@ -174,6 +195,10 @@ struct Block {
     finalized: bool,
     /// Gets a finalization certificate of its own.
     certified: bool,
+    /// Gets a notarization certificate (`NOTAR`).
+    notar: bool,
+    /// Gets a notarization-fallback certificate (`NOTAR_FALLBACK`).
+    notar_fallback: bool,
     /// The mock answers repair requests for it.
     repairable: bool,
     /// Its footer declares a wrong bank hash, so replay marks it dead. Never a finalized block.
@@ -258,6 +283,8 @@ fn plan(forks: &[usize], slot_max: usize, rng: &mut StdRng, repair_rng: &mut Std
             forked,
             finalized,
             certified,
+            notar: finalized,
+            notar_fallback: false,
             repairable,
             dead: false,
         });
@@ -278,6 +305,8 @@ fn plan(forks: &[usize], slot_max: usize, rng: &mut StdRng, repair_rng: &mut Std
             forked: true,
             finalized: false,
             certified: false,
+            notar: false,
+            notar_fallback: false,
             repairable,
             dead: false,
         });
@@ -320,6 +349,157 @@ impl Action {
     }
 }
 
+/// Skipped slots that receive a `SKIPPED` certificate: every gap slot before a finalized block.
+fn skipped_slots(blocks: &[Block]) -> BTreeSet<usize> {
+    let mut skipped = BTreeSet::new();
+    let mut after = 0;
+    for block in blocks.iter().filter(|block| block.finalized) {
+        skipped.extend(after + 1..block.slot);
+        after = block.slot;
+    }
+    skipped
+}
+
+/// Assign `NOTAR` and `NOTAR_FALLBACK` certificates across slots in slot order, respecting
+/// Alpenglow's <20% Byzantine stake bounds:
+/// - Directly finalized slot (`FINAL`): `NOTAR` on the finalized block, 0 conflicting `NOTAR_FALLBACK`.
+/// - Implied-finalized slot (no `FINAL`): either `NOTAR` on lineage + <=1 `NOTAR_FALLBACK` fork,
+///   or `NOTAR_FALLBACK` on lineage + <=3 `NOTAR_FALLBACK` forks (<=4 total).
+/// - Non-finalized slot (open tip or skipped): <=4 `NOTAR_FALLBACK` blocks (or `NOTAR` on open tip
+///   + <=1 `NOTAR_FALLBACK` fork).
+/// - No `dead` block can be certified, and every certified fork must extend genesis or a certified
+///   parent via either a consecutive slot or a skip-certified window start.
+fn assign_notar_fallbacks(blocks: &mut [Block], rng: &mut StdRng) {
+    let skipped = skipped_slots(blocks);
+    let mut by_slot: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, b) in blocks.iter().enumerate() {
+        by_slot.entry(b.slot).or_default().push(i);
+    }
+
+    for (_slot, indices) in by_slot {
+        let lineage_idx = indices.iter().copied().find(|&i| blocks[i].version == 0);
+        let has_final = lineage_idx.is_some_and(|i| blocks[i].certified);
+        if has_final {
+            // Finalized slot: lineage block must have NOTAR + FINAL; 0 conflicting NOTAR_FALLBACK.
+            continue;
+        }
+
+        // First decide whether an implied-finalized lineage block uses NOTAR_FALLBACK instead of NOTAR,
+        // or whether an alive open tip gets NOTAR or NOTAR_FALLBACK.
+        if let Some(l) = lineage_idx {
+            if blocks[l].finalized {
+                // Implied-finalized lineage block: switch to NOTAR_FALLBACK half the time.
+                if rng.random_ratio(1, NOTAR_FALLBACK_LINEAGE_ONE_IN) {
+                    blocks[l].notar = false;
+                    blocks[l].notar_fallback = true;
+                }
+            } else if !blocks[l].dead && is_cert_eligible(blocks, l, &skipped) {
+                // Alive open tip: optionally assign NOTAR or NOTAR_FALLBACK.
+                match rng.random_range(0..4u32) {
+                    0 => blocks[l].notar = true,
+                    1 => blocks[l].notar_fallback = true,
+                    _ => {}
+                }
+            }
+        }
+
+        let has_notar = indices.iter().any(|&i| blocks[i].notar);
+        let existing_nf = indices.iter().filter(|&&i| blocks[i].notar_fallback).count();
+        let max_nf = if has_notar {
+            MAX_NOTAR_FALLBACK_WITH_NOTAR
+        } else {
+            MAX_NOTAR_FALLBACK_BLOCKS
+        };
+        let remaining_cap = max_nf.saturating_sub(existing_nf);
+        if remaining_cap == 0 {
+            continue;
+        }
+
+        let mut eligible_forks: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| {
+                blocks[i].version > 0
+                    && !blocks[i].dead
+                    && !blocks[i].notar
+                    && !blocks[i].notar_fallback
+                    && is_cert_eligible(blocks, i, &skipped)
+            })
+            .collect();
+        eligible_forks.shuffle(rng);
+
+        let mut added = 0;
+        for f in eligible_forks {
+            if added >= remaining_cap {
+                break;
+            }
+            if rng.random_ratio(1, NOTAR_FALLBACK_FORK_ONE_IN) {
+                blocks[f].notar_fallback = true;
+                added += 1;
+            }
+        }
+    }
+
+    validate_alpenglow_cert_bounds(blocks, &skipped);
+}
+
+fn is_cert_eligible(blocks: &[Block], idx: usize, skipped: &BTreeSet<usize>) -> bool {
+    let b = &blocks[idx];
+    if b.dead {
+        return false;
+    }
+    let parent_slot = match b.parent {
+        None => 0,
+        Some(p) => {
+            if !(blocks[p].notar || blocks[p].notar_fallback) {
+                return false;
+            }
+            blocks[p].slot
+        }
+    };
+    if parent_slot + 1 == b.slot {
+        return true;
+    }
+    let is_window_start = b.slot == 1 || b.slot.is_multiple_of(LEADER_WINDOW_SLOTS);
+    is_window_start && (parent_slot + 1..b.slot).all(|g| skipped.contains(&g))
+}
+
+fn validate_alpenglow_cert_bounds(blocks: &[Block], skipped: &BTreeSet<usize>) {
+    let mut by_slot: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, b) in blocks.iter().enumerate() {
+        by_slot.entry(b.slot).or_default().push(i);
+    }
+    for (slot, indices) in by_slot {
+        let finals = indices.iter().filter(|&&i| blocks[i].certified).count();
+        let notars = indices.iter().filter(|&&i| blocks[i].notar).count();
+        let nfs = indices.iter().filter(|&&i| blocks[i].notar_fallback).count();
+        assert!(finals <= 1, "slot {slot}: >1 FINAL");
+        assert!(notars <= 1, "slot {slot}: >1 NOTAR");
+        if finals == 1 {
+            assert_eq!(notars, 1, "slot {slot}: FINAL requires NOTAR");
+            assert_eq!(nfs, 0, "slot {slot}: FINAL forbids conflicting NOTAR_FALLBACK");
+            assert!(!skipped.contains(&slot), "slot {slot}: FINAL forbids SKIPPED");
+        } else if notars == 1 {
+            assert!(nfs <= MAX_NOTAR_FALLBACK_WITH_NOTAR, "slot {slot}: NOTAR allows <=1 NOTAR_FALLBACK");
+        } else {
+            assert!(nfs <= MAX_NOTAR_FALLBACK_BLOCKS, "slot {slot}: at most 4 NOTAR_FALLBACK");
+        }
+        assert!(notars + nfs <= MAX_NOTAR_FALLBACK_BLOCKS, "slot {slot}: total certified blocks > 4");
+        for &i in &indices {
+            assert!(!(blocks[i].notar && blocks[i].notar_fallback), "block {i} has both NOTAR and NOTAR_FALLBACK");
+            if blocks[i].certified || blocks[i].notar || blocks[i].notar_fallback {
+                assert!(!blocks[i].dead, "dead block {i} cannot be certified");
+                if let Some(p) = blocks[i].parent {
+                    assert!(
+                        blocks[p].notar || blocks[p].notar_fallback,
+                        "certified block {i} has uncertified parent {p}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Every action of the lineage: each block's shreds and certificates, a `REPAIR` for each
 /// repairable block, and a `SKIPPED` for every skipped slot before a finalized block.
 fn actions(blocks: &[Block]) -> Vec<Action> {
@@ -330,17 +510,18 @@ fn actions(blocks: &[Block]) -> Vec<Action> {
         if block.certified {
             actions.push(on(FINAL));
         }
-        if block.finalized {
+        if block.notar {
             actions.push(on(NOTAR));
+        }
+        if block.notar_fallback {
+            actions.push(on(NOTAR_FALLBACK));
         }
         if block.repairable {
             actions.push(on(REPAIR));
         }
     }
-    let mut after = 0;
-    for block in blocks.iter().filter(|block| block.finalized) {
-        actions.extend((after + 1..block.slot).map(|slot| Action { kind: SKIPPED, block: None, slot }));
-        after = block.slot;
+    for slot in skipped_slots(blocks) {
+        actions.push(Action { kind: SKIPPED, block: None, slot });
     }
     actions
 }
@@ -396,6 +577,13 @@ impl<'a> Run<'a> {
         };
         match a.kind {
             FINAL | NOTAR => (0..=b).all(|i| self.fulls[i] || self.blocks[i].repairable),
+            NOTAR_FALLBACK => {
+                if self.blocks[b].version == 0 {
+                    (0..=b).all(|i| self.fulls[i] || self.blocks[i].repairable)
+                } else {
+                    true
+                }
+            }
             REPAIR => true,
             _ => !waits,
         }
@@ -406,7 +594,7 @@ impl<'a> Run<'a> {
         if let Some(b) = a.block {
             match a.kind {
                 FINAL => self.finalized = self.finalized.max(Some(b)),
-                NOTAR | REPAIR => {}
+                NOTAR | NOTAR_FALLBACK | REPAIR => {}
                 _ => {
                     self.fulls[b] = true;
                     while self.delivered < self.lineage_len && self.fulls[self.delivered] {
@@ -441,6 +629,9 @@ impl<'a> Run<'a> {
         let _ = write!(out, "{prefix}{}{}", if last { "└── " } else { "├── " }, label(self.blocks, Some(b)));
         if self.turbine(b) {
             let _ = write!(out, "  {TURBINE}");
+        }
+        if self.blocks[b].notar_fallback {
+            out.push_str("  NF");
         }
         if self.blocks[b].repairable {
             out.push_str("  REPAIR");
@@ -542,6 +733,7 @@ fn main() -> Result<(), Error> {
     let mut repair_rng = stream(args.seed, 0x7265_7061_6972_0000);
     let mut fork_rng = stream(args.seed, 0x666f_726b_0000_0000);
     let mut dead_rng = stream(args.seed, 0x6465_6164_0000_0000);
+    let mut nf_rng = stream(args.seed, 0x6e6f_7461_7266_6200);
     let mut shuffle_rng = stream(args.seed, 0x7368_7566_666c_6500);
     let mut generators = tuple_list!(DepthLimiter::new(STRUCTURE.inner(), args.depth));
 
@@ -570,6 +762,7 @@ fn main() -> Result<(), Error> {
         for block in &mut blocks {
             block.dead = !block.finalized && dead_rng.random_ratio(1, DEAD_ONE_IN);
         }
+        assign_notar_fallbacks(&mut blocks, &mut nf_rng);
         let mut actions = actions(&blocks);
         actions.shuffle(&mut shuffle_rng);
         let mut run = Run::new(&blocks, args.slot_max);
