@@ -152,6 +152,9 @@ const DEAD_ONE_IN: u32 = 4;
 /// Alpenglow leader window size (consecutive leader slots).
 const LEADER_WINDOW_SLOTS: usize = 4;
 
+/// One in this many eligible window-start blocks uses Fast Leader Handover (`UpdateParent`).
+const FLH_ONE_IN: u32 = 2;
+
 /// Under Alpenglow's <20% Byzantine stake bound:
 /// - A slot with no `Notarize`/`Finalize` cert can have at most 4 conflicting `NotarizeFallback` certs.
 /// - A slot with a `Notarize` cert (and no `Finalize` cert) can have at most 1 conflicting `NotarizeFallback` cert.
@@ -203,6 +206,8 @@ struct Block {
     repairable: bool,
     /// Its footer declares a wrong bank hash, so replay marks it dead. Never a finalized block.
     dead: bool,
+    /// Optimistic parent this window-start block started on before `UpdateParent`, if any.
+    optimistic_parent: Option<usize>,
 }
 
 /// Block `b`'s label, or the genesis root's for `None`.
@@ -287,6 +292,7 @@ fn plan(forks: &[usize], slot_max: usize, rng: &mut StdRng, repair_rng: &mut Std
             notar_fallback: false,
             repairable,
             dead: false,
+            optimistic_parent: None,
         });
     }
     // Add to `forks` a fork in `slot`, at or before lineage block `b`'s,
@@ -309,6 +315,7 @@ fn plan(forks: &[usize], slot_max: usize, rng: &mut StdRng, repair_rng: &mut Std
             notar_fallback: false,
             repairable,
             dead: false,
+            optimistic_parent: None,
         });
     };
     // In slot order, so a fork can build on any fork before it.
@@ -500,6 +507,51 @@ fn validate_alpenglow_cert_bounds(blocks: &[Block], skipped: &BTreeSet<usize>) {
     }
 }
 
+/// Assign Fast Leader Handover (`UpdateParent`) optimistic parents to eligible blocks.
+///
+/// FLH is only allowed on window-start slots (`slot > 0 && slot % LEADER_WINDOW_SLOTS == 0`).
+/// A valid optimistic parent `opt` must satisfy `parent_slot <= opt.slot < block.slot` and
+/// `opt != block.parent`.
+fn assign_flh(blocks: &mut [Block], rng: &mut StdRng) {
+    for b in 0..blocks.len() {
+        let slot = blocks[b].slot;
+        if slot == 0 || !slot.is_multiple_of(LEADER_WINDOW_SLOTS) {
+            continue;
+        }
+        let p_slot = blocks[b].parent.map_or(0, |p| blocks[p].slot);
+        let candidates: Vec<usize> = (0..blocks.len())
+            .filter(|&c| blocks[c].slot >= p_slot && blocks[c].slot < slot && Some(c) != blocks[b].parent)
+            .collect();
+        if !candidates.is_empty() && rng.random_ratio(1, FLH_ONE_IN) {
+            blocks[b].optimistic_parent = Some(candidates[rng.random_range(0..candidates.len())]);
+        }
+    }
+    validate_flh(blocks);
+}
+
+fn validate_flh(blocks: &[Block]) {
+    for (i, b) in blocks.iter().enumerate() {
+        let Some(opt) = b.optimistic_parent else { continue };
+        assert!(
+            b.slot > 0 && b.slot.is_multiple_of(LEADER_WINDOW_SLOTS),
+            "block {i} (slot {}): FLH is only valid at window start",
+            b.slot
+        );
+        let p_slot = b.parent.map_or(0, |p| blocks[p].slot);
+        assert!(
+            blocks[opt].slot >= p_slot && blocks[opt].slot < b.slot,
+            "block {i} (slot {}): optimistic parent {opt} (slot {}) must satisfy parent_slot ({p_slot}) <= opt_slot < slot",
+            b.slot,
+            blocks[opt].slot
+        );
+        assert_ne!(
+            Some(opt),
+            b.parent,
+            "block {i}: optimistic parent must differ from parent"
+        );
+    }
+}
+
 /// Every action of the lineage: each block's shreds and certificates, a `REPAIR` for each
 /// repairable block, and a `SKIPPED` for every skipped slot before a finalized block.
 fn actions(blocks: &[Block]) -> Vec<Action> {
@@ -630,6 +682,9 @@ impl<'a> Run<'a> {
         if self.turbine(b) {
             let _ = write!(out, "  {TURBINE}");
         }
+        if let Some(opt) = self.blocks[b].optimistic_parent {
+            let _ = write!(out, "  FLH(opt={})", label(self.blocks, Some(opt)));
+        }
         if self.blocks[b].notar_fallback {
             out.push_str("  NF");
         }
@@ -706,10 +761,15 @@ fn blocks_json(blocks: &[Block]) -> Vec<String> {
         .map(|b| {
             let (node, parent, block) = (label(blocks, Some(b)), parent(blocks, b), &blocks[b]);
             let replay = replay(blocks, b);
-            format!(
-                "{{\"node\": \"{node}\", \"parent\": \"{parent}\", \"repair\": {}, \"replay\": \"{replay}\", \"dead\": {}}}",
+            let mut out = format!(
+                "{{\"node\": \"{node}\", \"parent\": \"{parent}\", \"repair\": {}, \"replay\": \"{replay}\", \"dead\": {}",
                 block.repairable, block.dead
-            )
+            );
+            if let Some(opt) = block.optimistic_parent {
+                let _ = write!(out, ", \"optimistic_parent\": \"{}\"", label(blocks, Some(opt)));
+            }
+            out.push('}');
+            out
         })
         .collect()
 }
@@ -727,12 +787,13 @@ fn main() -> Result<(), Error> {
     anyhow::ensure!(args.slot_max >= 2, "a window needs at least 2 slots");
     let mut rng = stream(args.seed, 0);
     // Keep the generated lineages stable for a seed while choosing slots and fates, which blocks
-    // are repairable, the forks' parents and fates, which blocks are dead, and how the actions are
-    // shuffled.
+    // are repairable, the forks' parents and fates, which blocks are dead, FLH optimistic parents,
+    // and how the actions are shuffled.
     let mut fate_rng = stream(args.seed, 0x6661_7465_0000_0000);
     let mut repair_rng = stream(args.seed, 0x7265_7061_6972_0000);
     let mut fork_rng = stream(args.seed, 0x666f_726b_0000_0000);
     let mut dead_rng = stream(args.seed, 0x6465_6164_0000_0000);
+    let mut flh_rng = stream(args.seed, 0x666c_6800_0000_0000);
     let mut nf_rng = stream(args.seed, 0x6e6f_7461_7266_6200);
     let mut shuffle_rng = stream(args.seed, 0x7368_7566_666c_6500);
     let mut generators = tuple_list!(DepthLimiter::new(STRUCTURE.inner(), args.depth));
@@ -762,6 +823,7 @@ fn main() -> Result<(), Error> {
         for block in &mut blocks {
             block.dead = !block.finalized && dead_rng.random_ratio(1, DEAD_ONE_IN);
         }
+        assign_flh(&mut blocks, &mut flh_rng);
         assign_notar_fallbacks(&mut blocks, &mut nf_rng);
         let mut actions = actions(&blocks);
         actions.shuffle(&mut shuffle_rng);
